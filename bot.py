@@ -22,26 +22,26 @@ from config import (
     ADMIN_TELEGRAM_IDS,
     BOT_TOKEN,
     BRAND_OTHER_LABEL,
-    MASTERS,
     SERVICES,
     TIME_SLOTS,
 )
 from keyboards import (
+    bookings_carousel_inline,
     brands_inline,
     cancel_reply,
     confirm_inline,
     date_inline,
     edit_field_inline,
     main_menu,
-    masters_inline,
     models_inline,
-    recent_bookings_inline,
     report_menu_inline,
     services_inline,
+    skip_or_cancel_reply,
+    status_booking_mode_inline,
     status_pick_booking,
     time_inline,
 )
-from reports_parser import ParsedReport, parse_report_message
+from reports_parser import parse_report_message
 from utils import combine_local_datetime, normalize_phone, parse_date_text, parse_time_text
 
 logging.basicConfig(level=logging.INFO)
@@ -53,6 +53,36 @@ if not BOT_TOKEN:
 state_storage = StateMemoryStorage()
 bot = telebot.TeleBot(BOT_TOKEN, state_storage=state_storage, use_class_middlewares=True)
 
+FIELD_SKIPPED = "—"
+SERVICE_SKIPPED = "Не указано"
+SKIP_LABEL = "⏭️ Пропустить"
+BOOKINGS_PAGE_SIZE = 10
+BOOKING_SLOT_MINUTES = 120
+
+BTN_NEW = "📝 Новая запись"
+BTN_REPORTS = "📊 Отчёты"
+BTN_STATUS = "📋 Статус записи"
+BTN_HELP = "❓ Помощь"
+BTN_CANCEL = "⏹️ Отмена"
+
+
+def is_skip_text(text: str) -> bool:
+    """Текст с reply-клавиатуры и inline иногда отличается (variation selector у эмодзи)."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t == "Пропустить":
+        return True
+    t_plain = t.replace("\ufe0f", "").replace("\u200d", "").strip()
+    skip_plain = SKIP_LABEL.replace("\ufe0f", "").replace("\u200d", "")
+    if t_plain == skip_plain:
+        return True
+    return t_plain.endswith("Пропустить") and len(t_plain) <= 24
+
+
+def is_cancel_reply(text: str) -> bool:
+    return (text or "").strip() in (BTN_CANCEL, "Отмена")
+
 
 class BookingStates(StatesGroup):
     client_name = State()
@@ -61,13 +91,11 @@ class BookingStates(StatesGroup):
     car_brand_text = State()
     car_model = State()
     car_model_custom = State()
-    plate = State()
     service = State()
     date_pick = State()
     date_text = State()
     time_pick = State()
     time_text = State()
-    master = State()
     review = State()
     pick_edit = State()
     report_query = State()
@@ -91,9 +119,7 @@ def booking_as_draft(b: db.BookingRow) -> dict[str, Any]:
             "client_name": b.client_name,
             "phone": b.phone,
             "make_model": b.make_model,
-            "license_plate": b.license_plate,
             "service": b.service,
-            "master_name": b.master_name,
             "booking_date": sa.date().isoformat(),
             "booking_time": (sa.hour, sa.minute),
         }
@@ -102,9 +128,7 @@ def booking_as_draft(b: db.BookingRow) -> dict[str, Any]:
             "client_name": b.client_name,
             "phone": b.phone,
             "make_model": b.make_model,
-            "license_plate": b.license_plate,
             "service": b.service,
-            "master_name": b.master_name,
             "booking_date": "",
             "booking_time": None,
         }
@@ -125,11 +149,85 @@ def draft_lines(data: dict[str, Any]) -> str:
         f"Клиент: {data.get('client_name', '—')}\n"
         f"Телефон: {data.get('phone', '—')}\n"
         f"Авто: {data.get('make_model', '—')}\n"
-        f"Госномер: {data.get('license_plate', '—')}\n"
         f"Услуга: {data.get('service', '—')}\n"
-        f"Дата и время: {dt_s}\n"
-        f"Мастер: {data.get('master_name') or 'Не назначен'}"
+        f"Дата и время: {dt_s}"
     )
+
+
+def schedule_overlap_reminder_text(data: dict[str, Any]) -> str:
+    """Напоминание при совпадении интервала с уже подтверждёнными записями (не блокирует сохранение)."""
+    d_iso = data.get("booking_date")
+    bt = data.get("booking_time")
+    if not d_iso or bt is None:
+        return ""
+    try:
+        h, m = bt
+        dd = date.fromisoformat(d_iso) if isinstance(d_iso, str) else d_iso
+        start_at = combine_local_datetime(dd, h, m)
+    except Exception:
+        return ""
+    end_at = start_at + timedelta(minutes=BOOKING_SLOT_MINUTES)
+    others = db.list_active_bookings_overlapping(
+        start_at,
+        end_at,
+        duration_fallback_minutes=BOOKING_SLOT_MINUTES,
+    )
+    if not others:
+        return ""
+    lines = [
+        "",
+        "⚠️ Напоминание: на это время уже есть другая машина в расписании "
+        "(если у вас два поста — можно подтверждать; иначе проверьте время).",
+    ]
+    for b in others[:8]:
+        try:
+            dt = datetime.fromisoformat(b.start_at)
+            ds = dt.strftime("%d.%m.%Y %H:%M")
+        except ValueError:
+            ds = str(b.start_at)[:16]
+        lines.append(f"• #{b.id} · {ds} · {b.make_model} — {b.client_name}")
+    if len(others) > 8:
+        lines.append("• …")
+    return "\n".join(lines)
+
+
+def _pop_state_keys(state: StateContext, *keys: str) -> None:
+    with state.data() as data:
+        for k in keys:
+            data.pop(k, None)
+
+
+def apply_skip_service(chat_id: int, state: StateContext) -> None:
+    with state.data() as data:
+        ret = data.get("return_to_review")
+    state.add_data(service=SERVICE_SKIPPED)
+    if ret:
+        goto_review(state, chat_id)
+        return
+    state.set(BookingStates.date_pick)
+    chat_ui.send_tracked(bot, chat_id, state, "Дата записи:", reply_markup=date_inline())
+
+
+def apply_skip_date(chat_id: int, state: StateContext) -> None:
+    _pop_state_keys(state, "booking_date")
+    with state.data() as data:
+        ret = data.get("return_to_review")
+    if ret:
+        goto_review(state, chat_id)
+        return
+    state.set(BookingStates.time_pick)
+    chat_ui.send_tracked(bot, chat_id, state, "Время:", reply_markup=time_inline())
+
+
+def apply_skip_time(chat_id: int, state: StateContext) -> None:
+    _pop_state_keys(state, "booking_time")
+    with state.data() as data:
+        ret = data.get("return_to_review")
+    if ret:
+        goto_review(state, chat_id)
+        return
+    state.set(BookingStates.review)
+    send_review(chat_id, state)
 
 
 def goto_review(state: StateContext, chat_id: int) -> None:
@@ -146,8 +244,8 @@ def start_booking_flow(chat_id: int, user_id: int, state: StateContext) -> None:
         bot,
         chat_id,
         state,
-        "Новая запись. Введите имя клиента:",
-        reply_markup=cancel_reply(),
+        "Новая запись. Введите имя клиента (или «Пропустить»):",
+        reply_markup=skip_or_cancel_reply(),
     )
 
 
@@ -159,9 +257,9 @@ def cmd_start(message: types.Message, state: StateContext):
     bot.send_message(
         message.chat.id,
         "Бот записи детейлинга.\n"
-        "• «Новая запись» — пошаговый ввод с кнопками.\n"
-        "• «Отчёты» — меню или напишите запрос текстом.\n"
-        "• «Статус записи» — выполнено / не пришёл / отмена.\n"
+        "• 📝 Новая запись — пошаговый ввод с кнопками.\n"
+        "• 📊 Отчёты — меню или напишите запрос текстом.\n"
+        "• 📋 Статус записи — смена статуса (предстоящие / завершённые).\n"
         "/cancel — сбросить текущий шаг.",
         reply_markup=main_menu(),
     )
@@ -176,7 +274,7 @@ def cmd_cancel(message: types.Message, state: StateContext):
     bot.send_message(message.chat.id, "Шаг сброшен.", reply_markup=main_menu())
 
 
-@bot.message_handler(func=lambda m: m.text == "Отмена", state="*")
+@bot.message_handler(func=lambda m: is_cancel_reply(m.text or ""), state="*")
 def reply_cancel(message: types.Message, state: StateContext):
     if not is_admin(message.from_user.id):
         return access_denied(message.chat.id)
@@ -185,7 +283,24 @@ def reply_cancel(message: types.Message, state: StateContext):
     bot.send_message(message.chat.id, "Ок, отменено.", reply_markup=main_menu())
 
 
-@bot.message_handler(func=lambda m: m.text == "Помощь")
+@bot.message_handler(
+    func=lambda m: is_skip_text(m.text or ""),
+    state=[BookingStates.service, BookingStates.date_pick, BookingStates.time_pick],
+)
+def reply_skip_while_inline_step(message: types.Message, state: StateContext):
+    """«Пропустить» с reply-клавиатуры на шагах, где основной ввод — inline (клавиатура с прошлого шага)."""
+    if not is_admin(message.from_user.id):
+        return access_denied(message.chat.id)
+    cur = state.get()
+    if cur == BookingStates.service.name:
+        return apply_skip_service(message.chat.id, state)
+    if cur == BookingStates.date_pick.name:
+        return apply_skip_date(message.chat.id, state)
+    if cur == BookingStates.time_pick.name:
+        return apply_skip_time(message.chat.id, state)
+
+
+@bot.message_handler(func=lambda m: (m.text or "").strip() == BTN_HELP)
 def help_btn(message: types.Message, state: StateContext):
     if not is_admin(message.from_user.id):
         return access_denied(message.chat.id)
@@ -193,15 +308,15 @@ def help_btn(message: types.Message, state: StateContext):
     bot.send_message(
         message.chat.id,
         "Бот записи детейлинга.\n"
-        "• «Новая запись» — пошаговый ввод с кнопками.\n"
-        "• «Отчёты» — меню или свой текстовый запрос.\n"
-        "• «Статус записи» — выполнено / не пришёл / отмена.\n"
+        "• 📝 Новая запись — пошаговый ввод с кнопками.\n"
+        "• 📊 Отчёты — меню или свой текстовый запрос.\n"
+        "• 📋 Статус записи — предстоящие и завершённые записи, смена статуса.\n"
         "/cancel — сбросить текущий шаг.",
         reply_markup=main_menu(),
     )
 
 
-@bot.message_handler(func=lambda m: m.text == "Новая запись")
+@bot.message_handler(func=lambda m: (m.text or "").strip() == BTN_NEW)
 def btn_new(message: types.Message, state: StateContext):
     if not is_admin(message.from_user.id):
         return access_denied(message.chat.id)
@@ -212,14 +327,18 @@ def btn_new(message: types.Message, state: StateContext):
 def step_name(message: types.Message, state: StateContext):
     if not is_admin(message.from_user.id):
         return access_denied(message.chat.id)
-    name = (message.text or "").strip()
-    if len(name) < 2:
+    raw = (message.text or "").strip()
+    if is_skip_text(raw):
+        name = FIELD_SKIPPED
+    else:
+        name = raw
+    if name != FIELD_SKIPPED and len(name) < 2:
         return chat_ui.send_tracked(
             bot,
             message.chat.id,
             state,
-            "Имя слишком короткое, введите ещё раз.",
-            reply_markup=cancel_reply(),
+            "Имя слишком короткое, введите ещё раз или нажмите «Пропустить».",
+            reply_markup=skip_or_cancel_reply(),
         )
     with state.data() as data:
         ret = data.get("return_to_review")
@@ -231,8 +350,8 @@ def step_name(message: types.Message, state: StateContext):
         bot,
         message.chat.id,
         state,
-        "Телефон клиента (можно с +7 или 8…):",
-        reply_markup=cancel_reply(),
+        "Телефон клиента (можно с +7 или 8…), или «Пропустить»:",
+        reply_markup=skip_or_cancel_reply(),
     )
 
 
@@ -240,15 +359,19 @@ def step_name(message: types.Message, state: StateContext):
 def step_phone(message: types.Message, state: StateContext):
     if not is_admin(message.from_user.id):
         return access_denied(message.chat.id)
-    ok, phone = normalize_phone(message.text or "")
-    if not ok:
-        return chat_ui.send_tracked(
-            bot,
-            message.chat.id,
-            state,
-            "Не похоже на российский номер. Пример: +79161234567 или 89161234567.",
-            reply_markup=cancel_reply(),
-        )
+    raw = (message.text or "").strip()
+    if is_skip_text(raw):
+        phone = FIELD_SKIPPED
+    else:
+        ok, phone = normalize_phone(raw)
+        if not ok:
+            return chat_ui.send_tracked(
+                bot,
+                message.chat.id,
+                state,
+                "Не похоже на российский номер. Пример: +79161234567 или 89161234567. Или «Пропустить».",
+                reply_markup=skip_or_cancel_reply(),
+            )
     with state.data() as data:
         ret = data.get("return_to_review")
     state.add_data(phone=phone)
@@ -282,7 +405,7 @@ def cb_brand(call: types.CallbackQuery, state: StateContext):
             bot,
             call.message.chat.id,
             state,
-            "Введите марку автомобиля (будет в быстром выборе в следующий раз):",
+            "Введите марку автомобиля (будет в быстром выборе в следующий раз).",
             reply_markup=cancel_reply(),
         )
     state.add_data(car_brand=brand)
@@ -326,6 +449,20 @@ def step_brand_text(message: types.Message, state: StateContext):
     )
 
 
+@bot.message_handler(state=BookingStates.car_brand)
+def car_brand_use_buttons_only(message: types.Message, state: StateContext):
+    if not is_admin(message.from_user.id):
+        return access_denied(message.chat.id)
+    brands = car_catalog.merged_brands_list()
+    return chat_ui.send_tracked(
+        bot,
+        message.chat.id,
+        state,
+        "Марка обязательна — выберите вариант кнопками под этим сообщением.",
+        reply_markup=brands_inline(brands),
+    )
+
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith("md:"), state=BookingStates.car_model)
 def cb_model(call: types.CallbackQuery, state: StateContext):
     if not is_admin(call.from_user.id):
@@ -343,7 +480,7 @@ def cb_model(call: types.CallbackQuery, state: StateContext):
             bot,
             call.message.chat.id,
             state,
-            f"Марка: {brand}. Введите модель (сохраним для этой марки):",
+            f"Марка: {brand}. Введите модель (сохраним для этой марки).",
             reply_markup=cancel_reply(),
         )
     idx = int(part)
@@ -356,13 +493,38 @@ def cb_model(call: types.CallbackQuery, state: StateContext):
     bot.answer_callback_query(call.id)
     if ret:
         return goto_review(state, call.message.chat.id)
-    state.set(BookingStates.plate)
+    state.set(BookingStates.service)
     return chat_ui.send_tracked(
         bot,
         call.message.chat.id,
         state,
-        "Госномер (как на машине):",
-        reply_markup=cancel_reply(),
+        "Выберите услугу:",
+        reply_markup=services_inline(),
+    )
+
+
+@bot.message_handler(state=BookingStates.car_model)
+def car_model_use_buttons_only(message: types.Message, state: StateContext):
+    if not is_admin(message.from_user.id):
+        return access_denied(message.chat.id)
+    with state.data() as data:
+        brand = data.get("car_brand") or ""
+        models_order: list[str] = list(data.get("models_order") or [])
+    if not models_order:
+        state.set(BookingStates.car_brand)
+        return chat_ui.send_tracked(
+            bot,
+            message.chat.id,
+            state,
+            "Сначала выберите марку кнопками ниже.",
+            reply_markup=brands_inline(car_catalog.merged_brands_list()),
+        )
+    return chat_ui.send_tracked(
+        bot,
+        message.chat.id,
+        state,
+        f"Модель обязательна — выберите кнопкой под сообщением (марка: {brand}).",
+        reply_markup=models_inline(models_order),
     )
 
 
@@ -387,34 +549,6 @@ def step_car_model_custom(message: types.Message, state: StateContext):
     state.add_data(make_model=make_model)
     if ret:
         return goto_review(state, message.chat.id)
-    state.set(BookingStates.plate)
-    chat_ui.send_tracked(
-        bot,
-        message.chat.id,
-        state,
-        "Госномер (как на машине):",
-        reply_markup=cancel_reply(),
-    )
-
-
-@bot.message_handler(state=BookingStates.plate)
-def step_plate(message: types.Message, state: StateContext):
-    if not is_admin(message.from_user.id):
-        return access_denied(message.chat.id)
-    plate = (message.text or "").strip().upper()
-    if len(plate) < 3:
-        return chat_ui.send_tracked(
-            bot,
-            message.chat.id,
-            state,
-            "Госномер слишком короткий.",
-            reply_markup=cancel_reply(),
-        )
-    with state.data() as data:
-        ret = data.get("return_to_review")
-    state.add_data(license_plate=plate)
-    if ret:
-        return goto_review(state, message.chat.id)
     state.set(BookingStates.service)
     chat_ui.send_tracked(
         bot,
@@ -423,6 +557,15 @@ def step_plate(message: types.Message, state: StateContext):
         "Выберите услугу:",
         reply_markup=services_inline(),
     )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "skp:sv", state=BookingStates.service)
+def cb_skip_service(call: types.CallbackQuery, state: StateContext):
+    if not is_admin(call.from_user.id):
+        return bot.answer_callback_query(call.id)
+    chat_ui.delete_callback_message(bot, call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id)
+    apply_skip_service(call.message.chat.id, state)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("svc:"), state=BookingStates.service)
@@ -442,6 +585,15 @@ def cb_service(call: types.CallbackQuery, state: StateContext):
     chat_ui.send_tracked(bot, call.message.chat.id, state, "Дата записи:", reply_markup=date_inline())
 
 
+@bot.callback_query_handler(func=lambda c: c.data == "skp:dt", state=BookingStates.date_pick)
+def cb_skip_date(call: types.CallbackQuery, state: StateContext):
+    if not is_admin(call.from_user.id):
+        return bot.answer_callback_query(call.id)
+    chat_ui.delete_callback_message(bot, call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id)
+    apply_skip_date(call.message.chat.id, state)
+
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith("dt:"), state=BookingStates.date_pick)
 def cb_date(call: types.CallbackQuery, state: StateContext):
     if not is_admin(call.from_user.id):
@@ -456,8 +608,8 @@ def cb_date(call: types.CallbackQuery, state: StateContext):
             bot,
             call.message.chat.id,
             state,
-            "Дата в формате ДД.ММ.ГГГГ или ГГГГ-ММ-ДД:",
-            reply_markup=cancel_reply(),
+            "Дата в формате ДД.ММ.ГГГГ или ГГГГ-ММ-ДД (или «Пропустить»):",
+            reply_markup=skip_or_cancel_reply(),
         )
     d = now.date()
     if code == 1:
@@ -474,14 +626,17 @@ def cb_date(call: types.CallbackQuery, state: StateContext):
 def step_date_text(message: types.Message, state: StateContext):
     if not is_admin(message.from_user.id):
         return access_denied(message.chat.id)
-    d = parse_date_text(message.text or "")
+    raw = (message.text or "").strip()
+    if is_skip_text(raw):
+        return apply_skip_date(message.chat.id, state)
+    d = parse_date_text(raw)
     if not d:
         return chat_ui.send_tracked(
             bot,
             message.chat.id,
             state,
-            "Не удалось разобрать дату. Пример: 15.04.2026",
-            reply_markup=cancel_reply(),
+            "Не удалось разобрать дату. Пример: 15.04.2026. Или «Пропустить».",
+            reply_markup=skip_or_cancel_reply(),
         )
     with state.data() as data:
         ret = data.get("return_to_review")
@@ -499,6 +654,15 @@ def step_date_text(message: types.Message, state: StateContext):
     chat_ui.send_tracked(bot, message.chat.id, state, "Время:", reply_markup=time_inline())
 
 
+@bot.callback_query_handler(func=lambda c: c.data == "skp:tm", state=BookingStates.time_pick)
+def cb_skip_time(call: types.CallbackQuery, state: StateContext):
+    if not is_admin(call.from_user.id):
+        return bot.answer_callback_query(call.id)
+    chat_ui.delete_callback_message(bot, call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id)
+    apply_skip_time(call.message.chat.id, state)
+
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith("tm:"), state=BookingStates.time_pick)
 def cb_time(call: types.CallbackQuery, state: StateContext):
     if not is_admin(call.from_user.id):
@@ -513,8 +677,8 @@ def cb_time(call: types.CallbackQuery, state: StateContext):
             bot,
             call.message.chat.id,
             state,
-            "Время в формате ЧЧ:ММ (например 14:30):",
-            reply_markup=cancel_reply(),
+            "Время в формате ЧЧ:ММ (например 14:30), или «Пропустить»:",
+            reply_markup=skip_or_cancel_reply(),
         )
     h, m = map(int, slot.split(":"))
     bot.answer_callback_query(call.id)
@@ -525,14 +689,17 @@ def cb_time(call: types.CallbackQuery, state: StateContext):
 def step_time_text(message: types.Message, state: StateContext):
     if not is_admin(message.from_user.id):
         return access_denied(message.chat.id)
-    parsed = parse_time_text(message.text or "")
+    raw = (message.text or "").strip()
+    if is_skip_text(raw):
+        return apply_skip_time(message.chat.id, state)
+    parsed = parse_time_text(raw)
     if not parsed:
         return chat_ui.send_tracked(
             bot,
             message.chat.id,
             state,
-            "Формат ЧЧ:ММ, например 09:30",
-            reply_markup=cancel_reply(),
+            "Формат ЧЧ:ММ, например 09:30. Или «Пропустить».",
+            reply_markup=skip_or_cancel_reply(),
         )
     h, m = parsed
     _finish_time_pick(message.chat.id, state, h, m)
@@ -541,39 +708,21 @@ def step_time_text(message: types.Message, state: StateContext):
 def _finish_time_pick(chat_id: int, state: StateContext, h: int, m: int) -> None:
     with state.data() as data:
         ret = data.get("return_to_review")
-        d_iso = data.get("booking_date")
-    if not d_iso:
-        chat_ui.send_tracked(bot, chat_id, state, "Сначала выберите дату.", reply_markup=cancel_reply())
-        return
-    d = date.fromisoformat(d_iso)
     state.add_data(booking_time=(h, m))
     if ret:
         return goto_review(state, chat_id)
-    state.set(BookingStates.master)
-    chat_ui.send_tracked(bot, chat_id, state, "Мастер:", reply_markup=masters_inline())
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("mst:"), state=BookingStates.master)
-def cb_master(call: types.CallbackQuery, state: StateContext):
-    if not is_admin(call.from_user.id):
-        return bot.answer_callback_query(call.id)
-    idx = int(call.data.split(":")[1])
-    name = MASTERS[idx]
-    master_name: Optional[str] = None if name == "Не назначен" else name
-    with state.data() as data:
-        ret = data.get("return_to_review")
-    state.add_data(master_name=master_name)
-    chat_ui.delete_callback_message(bot, call.message.chat.id, call.message.message_id)
-    bot.answer_callback_query(call.id)
-    if ret:
-        return goto_review(state, call.message.chat.id)
     state.set(BookingStates.review)
-    send_review(call.message.chat.id, state)
+    send_review(chat_id, state)
 
 
 def send_review(chat_id: int, state: StateContext) -> None:
     with state.data() as data:
-        text = "Проверьте данные:\n\n" + draft_lines(data)
+        snap = dict(data)
+        text = (
+            "Проверьте данные:\n\n"
+            + draft_lines(snap)
+            + schedule_overlap_reminder_text(snap)
+        )
     chat_ui.send_tracked(bot, chat_id, state, text, reply_markup=confirm_inline())
 
 
@@ -595,34 +744,39 @@ def cb_confirm(call: types.CallbackQuery, state: StateContext):
     if action != "ok":
         return
     with state.data() as data:
+        d_iso = data.get("booking_date")
+        bt = data.get("booking_time")
+        if not d_iso or bt is None:
+            return bot.send_message(
+                call.message.chat.id,
+                "Чтобы сохранить запись, укажите дату и время: «Изменить» → «Дата/время».",
+                reply_markup=confirm_inline(),
+            )
         try:
-            d_iso = data["booking_date"]
-            h, m = data["booking_time"]
+            h, m = bt
             start_at = combine_local_datetime(date.fromisoformat(d_iso), h, m)
         except Exception:
             state.delete()
             return bot.send_message(
                 call.message.chat.id,
-                "Не хватает даты/времени. Начните заново: «Новая запись».",
+                "Не удалось разобрать дату/время. Начните заново: «Новая запись».",
                 reply_markup=main_menu(),
             )
         payload = {
-            "client_name": data["client_name"],
-            "phone": data["phone"],
-            "make_model": data["make_model"],
-            "license_plate": data["license_plate"],
-            "service": data["service"],
-            "master_name": data.get("master_name"),
+            "client_name": data.get("client_name") or FIELD_SKIPPED,
+            "phone": data.get("phone") or FIELD_SKIPPED,
+            "make_model": data.get("make_model") or FIELD_SKIPPED,
+            "service": data.get("service") or SERVICE_SKIPPED,
             "start_at": start_at,
         }
     bid = db.create_booking(
         client_name=payload["client_name"],
         phone=payload["phone"],
         make_model=payload["make_model"],
-        license_plate=payload["license_plate"],
         service=payload["service"],
-        master_name=payload["master_name"],
         start_at=payload["start_at"],
+        license_plate="",
+        master_name=None,
         admin_telegram_id=call.from_user.id,
     )
     cal_err: Optional[str] = None
@@ -630,7 +784,7 @@ def cb_confirm(call: types.CallbackQuery, state: StateContext):
         try:
             desc = (
                 f"Тел: {payload['phone']}\n"
-                f"Авто: {payload['make_model']} {payload['license_plate']}\n"
+                f"Авто: {payload['make_model']}\n"
                 f"Услуга: {payload['service']}\n"
                 f"ID в боте: {bid}"
             )
@@ -682,16 +836,13 @@ def cb_edit_menu(call: types.CallbackQuery, state: StateContext):
         "nm": BookingStates.client_name,
         "ph": BookingStates.phone,
         "cr": BookingStates.car_brand,
-        "gp": BookingStates.plate,
         "sv": BookingStates.service,
         "dt": BookingStates.date_pick,
-        "ms": BookingStates.master,
     }
     prompts = {
-        "nm": "Новое имя клиента:",
-        "ph": "Новый телефон:",
+        "nm": "Новое имя клиента (или «Пропустить»):",
+        "ph": "Новый телефон (или «Пропустить»):",
         "cr": "Выберите марку и модель:",
-        "gp": "Новый госномер:",
         "sv": "Выберите услугу:",
     }
     if code not in mapping:
@@ -704,11 +855,6 @@ def cb_edit_menu(call: types.CallbackQuery, state: StateContext):
     if code == "dt":
         return chat_ui.send_tracked(
             bot, call.message.chat.id, state, "Новая дата:", reply_markup=date_inline()
-        )
-    if code == "ms":
-        state.set(BookingStates.master)
-        return chat_ui.send_tracked(
-            bot, call.message.chat.id, state, "Мастер:", reply_markup=masters_inline()
         )
     if code == "cr":
         brands = car_catalog.merged_brands_list()
@@ -723,12 +869,12 @@ def cb_edit_menu(call: types.CallbackQuery, state: StateContext):
         bot,
         call.message.chat.id,
         state,
-        prompts.get(code, "Введите значение:"),
-        reply_markup=cancel_reply(),
+        prompts.get(code, "Введите значение (или «Пропустить»):"),
+        reply_markup=skip_or_cancel_reply(),
     )
 
 
-@bot.message_handler(func=lambda m: m.text == "Отчёты")
+@bot.message_handler(func=lambda m: (m.text or "").strip() == BTN_REPORTS)
 def btn_reports(message: types.Message, state: StateContext):
     if not is_admin(message.from_user.id):
         return access_denied(message.chat.id)
@@ -761,7 +907,6 @@ def cb_report(call: types.CallbackQuery, state: StateContext):
         "tm": "tomorrow_list",
         "cd": "completed_today",
         "mo": "month_summary",
-        "ma": "master_month",
         "ns": "no_show_2w",
         "op": "open_cancelled",
         "st": "client_stats_month",
@@ -769,14 +914,6 @@ def cb_report(call: types.CallbackQuery, state: StateContext):
     kind = kinds.get(code)
     if not kind:
         return
-    if kind == "master_month":
-        state.set(BookingStates.report_query)
-        state.add_data(report_focus="master")
-        return bot.send_message(
-            call.message.chat.id,
-            "Напишите имя мастера или фразу целиком, например: «сколько записей у мастера Алексей за месяц».",
-            reply_markup=cancel_reply(),
-        )
     text = reports_engine.run_parsed(kind)
     bot.send_message(call.message.chat.id, text[:4000], reply_markup=main_menu())
 
@@ -786,13 +923,7 @@ def step_report_query(message: types.Message, state: StateContext):
     if not is_admin(message.from_user.id):
         return access_denied(message.chat.id)
     raw = message.text or ""
-    with state.data() as data:
-        focus = data.get("report_focus", "free")
     parsed = parse_report_message(raw)
-    if not parsed and raw:
-        parsed = parse_report_message("мастер " + raw)
-    if not parsed and focus == "master" and len(raw.strip()) >= 1:
-        parsed = ParsedReport("master_month", master_hint=raw.strip())
     if not parsed:
         state.delete()
         return bot.send_message(
@@ -801,29 +932,157 @@ def step_report_query(message: types.Message, state: StateContext):
             reply_markup=main_menu(),
         )
     state.delete()
-    out = reports_engine.run_parsed(parsed.kind, parsed.master_hint)
+    out = reports_engine.run_parsed(parsed.kind)
     bot.send_message(message.chat.id, out[:4000], reply_markup=main_menu())
 
 
-@bot.message_handler(func=lambda m: m.text == "Статус записи")
+def _format_booking_list_button(r: db.BookingRow, *, completed_section: bool) -> str:
+    try:
+        ds = datetime.fromisoformat(r.start_at).strftime("%d.%m %H:%M")
+    except ValueError:
+        ds = str(r.start_at)[:16]
+    icon = "✅" if completed_section else "📅"
+    line = f"{icon} #{r.id} · {ds} · {r.client_name}"
+    if len(line) > 64:
+        line = line[:61] + "…"
+    return line
+
+
+def _status_bookings_caption(mode: str, page: int, total: int) -> str:
+    per_page = BOOKINGS_PAGE_SIZE
+    total_pages = max(1, (total + per_page - 1) // per_page) if total else 1
+    page_show = min(page + 1, total_pages)
+    if mode == "u":
+        head = "📅 Предстоящие записи"
+        sub = "Ближайшие по времени приёма."
+    else:
+        head = "✅ Завершённые записи"
+        sub = "По дате завершения (сначала недавние)."
+    return (
+        f"{head}\n{sub}\n\n"
+        f"📄 Страница {page_show} из {total_pages} · всего записей: {total}\n"
+        f"По {BOOKINGS_PAGE_SIZE} на странице. Выберите запись:"
+    )
+
+
+def _status_bookings_keyboard(mode: str, page: int, rows: list[db.BookingRow], total: int) -> types.InlineKeyboardMarkup:
+    completed = mode == "c"
+    items = [(r.id, _format_booking_list_button(r, completed_section=completed)) for r in rows]
+    return bookings_carousel_inline(mode, page, BOOKINGS_PAGE_SIZE, total, items)
+
+
+def _render_status_booking_list(
+    chat_id: int,
+    message_id: int,
+    mode: str,
+    page: int,
+) -> None:
+    if mode == "u":
+        total = db.count_upcoming_bookings()
+        total_pages = max(1, (total + BOOKINGS_PAGE_SIZE - 1) // BOOKINGS_PAGE_SIZE) if total else 1
+        page = max(0, min(page, total_pages - 1))
+        offset = page * BOOKINGS_PAGE_SIZE
+        rows = db.list_upcoming_bookings_page(offset, BOOKINGS_PAGE_SIZE)
+    else:
+        total = db.count_completed_bookings()
+        total_pages = max(1, (total + BOOKINGS_PAGE_SIZE - 1) // BOOKINGS_PAGE_SIZE) if total else 1
+        page = max(0, min(page, total_pages - 1))
+        offset = page * BOOKINGS_PAGE_SIZE
+        rows = db.list_completed_bookings_page(offset, BOOKINGS_PAGE_SIZE)
+    text = _status_bookings_caption(mode, page, total)
+    kb = _status_bookings_keyboard(mode, page, rows, total)
+    bot.edit_message_text(
+        text,
+        chat_id=chat_id,
+        message_id=message_id,
+        reply_markup=kb,
+    )
+
+
+@bot.message_handler(func=lambda m: (m.text or "").strip() == BTN_STATUS)
 def btn_status(message: types.Message, state: StateContext):
     if not is_admin(message.from_user.id):
         return access_denied(message.chat.id)
     state.delete()
-    rows = db.list_recent_bookings(15)
-    if not rows:
-        return bot.send_message(message.chat.id, "Записей пока нет.", reply_markup=main_menu())
-    titles: list[tuple[int, str]] = []
-    for r in rows:
-        try:
-            ds = datetime.fromisoformat(r.start_at).strftime("%d.%m %H:%M")
-        except ValueError:
-            ds = r.start_at
-        titles.append((r.id, f"#{r.id} {ds} {r.client_name} {r.license_plate}"))
     bot.send_message(
         message.chat.id,
-        "Выберите запись:",
-        reply_markup=recent_bookings_inline(titles),
+        "📋 Статус записи\n\n"
+        "Сначала выберите раздел: предстоящие визиты или уже завершённые работы.",
+        reply_markup=status_booking_mode_inline(),
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("slm:"))
+def cb_status_list_mode(call: types.CallbackQuery, state: StateContext):
+    if not is_admin(call.from_user.id):
+        return bot.answer_callback_query(call.id)
+    code = call.data.split(":")[1]
+    bot.answer_callback_query(call.id)
+    if code == "menu":
+        return bot.edit_message_text(
+            "📋 Статус записи\n\nВыберите раздел:",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=status_booking_mode_inline(),
+        )
+    if code not in ("u", "c"):
+        return
+    mode = code
+    if mode == "u":
+        total = db.count_upcoming_bookings()
+        empty_msg = "📅 Предстоящих записей сейчас нет."
+    else:
+        total = db.count_completed_bookings()
+        empty_msg = "✅ Завершённых записей в базе пока нет."
+    if total == 0:
+        return bot.edit_message_text(
+            f"{empty_msg}\n\nВыберите другой раздел:",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=status_booking_mode_inline(),
+        )
+    _render_status_booking_list(call.message.chat.id, call.message.message_id, mode, 0)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("bpg:"))
+def cb_bookings_page(call: types.CallbackQuery, state: StateContext):
+    if not is_admin(call.from_user.id):
+        return bot.answer_callback_query(call.id)
+    parts = call.data.split(":")
+    if len(parts) != 3:
+        return bot.answer_callback_query(call.id)
+    mode, page_s = parts[1], parts[2]
+    if mode not in ("u", "c"):
+        return bot.answer_callback_query(call.id)
+    try:
+        page = int(page_s)
+    except ValueError:
+        return bot.answer_callback_query(call.id)
+    bot.answer_callback_query(call.id)
+    _render_status_booking_list(call.message.chat.id, call.message.message_id, mode, page)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("bpi:"))
+def cb_bookings_page_info(call: types.CallbackQuery, state: StateContext):
+    if not is_admin(call.from_user.id):
+        return bot.answer_callback_query(call.id)
+    parts = call.data.split(":")
+    if len(parts) != 3:
+        return bot.answer_callback_query(call.id)
+    mode, page_s = parts[1], parts[2]
+    if mode not in ("u", "c"):
+        return bot.answer_callback_query(call.id)
+    try:
+        page = int(page_s)
+    except ValueError:
+        return bot.answer_callback_query(call.id)
+    total = db.count_upcoming_bookings() if mode == "u" else db.count_completed_bookings()
+    per_page = BOOKINGS_PAGE_SIZE
+    total_pages = max(1, (total + per_page - 1) // per_page) if total else 1
+    bot.answer_callback_query(
+        call.id,
+        text=f"Страница {page + 1} из {total_pages}. Всего записей: {total}.",
+        show_alert=False,
     )
 
 

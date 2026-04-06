@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from telebot import TeleBot
+from telebot import TeleBot, types
 from telebot.states.sync.context import StateContext
 
 log = logging.getLogger(__name__)
@@ -54,7 +54,26 @@ def send_tracked(
             bot.delete_message(chat_id, old)
         except Exception as e:  # noqa: BLE001
             log.debug("delete_message %s: %s", old, e)
+    remove_msg_id: int | None = None
+    reply_markup = kwargs.get("reply_markup")
+    if isinstance(reply_markup, types.InlineKeyboardMarkup):
+        try:
+            rm = bot.send_message(
+                chat_id,
+                "\u2060",
+                reply_markup=types.ReplyKeyboardRemove(),
+                disable_notification=True,
+            )
+            remove_msg_id = rm.message_id
+        except Exception as e:  # noqa: BLE001
+            log.debug("ReplyKeyboardRemove: %s", e)
+
     msg = bot.send_message(chat_id, text, **kwargs)
+    if remove_msg_id is not None:
+        try:
+            bot.delete_message(chat_id, remove_msg_id)
+        except Exception as e:  # noqa: BLE001
+            log.debug("delete_message after ReplyKeyboardRemove: %s", e)
     ids.append(msg.message_id)
     _set_ids(state, ids)
     return msg

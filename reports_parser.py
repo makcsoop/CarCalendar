@@ -23,10 +23,6 @@ def parse_report_message(text: str) -> Optional[ParsedReport]:
         return ParsedReport("tomorrow_list")
     if "сегодня" in t and re.search(r"выполнен|услуг", t):
         return ParsedReport("completed_today")
-    if re.search(r"месяц", t) and re.search(r"мастер", t):
-        m = re.search(r"мастер[аеу]?\s+([a-zа-яё\-]+)", t, re.I)
-        hint = m.group(1) if m else None
-        return ParsedReport("master_month", master_hint=hint)
     if re.search(r"месяц", t) and re.search(r"сколько|запис|свод", t):
         return ParsedReport("month_summary")
     if re.search(r"не\s*приш", t) or "no_show" in t:

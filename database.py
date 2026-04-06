@@ -157,10 +157,10 @@ def create_booking(
     client_name: str,
     phone: str,
     make_model: str,
-    license_plate: str,
     service: str,
-    master_name: Optional[str],
     start_at: datetime,
+    license_plate: str = "",
+    master_name: Optional[str] = None,
     duration_minutes: int = 120,
     admin_telegram_id: Optional[int] = None,
     calendar_uid: Optional[str] = None,
@@ -176,7 +176,7 @@ def create_booking(
         client_id = int(cur.lastrowid)
         cur = conn.execute(
             "INSERT INTO vehicles (client_id, make_model, license_plate) VALUES (?, ?, ?)",
-            (client_id, make_model.strip(), license_plate.strip().upper()),
+            (client_id, make_model.strip(), (license_plate or "").strip().upper()),
         )
         vehicle_id = int(cur.lastrowid)
         cur = conn.execute(
@@ -291,6 +291,45 @@ def update_booking_fields(
             )
 
 
+def list_active_bookings_overlapping(
+    start_at: datetime,
+    end_at: datetime,
+    *,
+    exclude_booking_id: Optional[int] = None,
+    duration_fallback_minutes: int = 120,
+) -> list[BookingRow]:
+    """
+    Записи со статусом confirmed/rescheduled, интервал [start_at, end_at) которых
+    пересекается с переданным [start_at, end_at).
+    """
+    new_s = start_at.isoformat(timespec="minutes")
+    new_e = end_at.isoformat(timespec="minutes")
+    with get_conn() as conn:
+        fb = int(duration_fallback_minutes)
+        sql = f"""
+            SELECT b.id, c.name AS client_name, c.phone, v.make_model, v.license_plate,
+                   b.service, b.master_name, b.start_at, b.status
+            FROM bookings b
+            JOIN clients c ON c.id = b.client_id
+            JOIN vehicles v ON v.id = b.vehicle_id
+            WHERE b.status IN ('confirmed', 'rescheduled')
+              AND datetime(b.start_at) < datetime(?)
+              AND datetime(
+                    COALESCE(
+                        b.end_at,
+                        datetime(b.start_at, '+{fb} minutes')
+                    )
+                  ) > datetime(?)
+        """
+        params: list[Any] = [new_e, new_s]
+        if exclude_booking_id is not None:
+            sql += " AND b.id != ?"
+            params.append(exclude_booking_id)
+        sql += " ORDER BY b.start_at"
+        rows = conn.execute(sql, params).fetchall()
+    return [_row_to_booking(r) for r in rows]
+
+
 def get_booking(booking_id: int) -> Optional[BookingRow]:
     with get_conn() as conn:
         row = conn.execute(
@@ -331,6 +370,73 @@ def list_recent_bookings(limit: int = 15) -> list[BookingRow]:
             LIMIT ?
             """,
             (limit,),
+        ).fetchall()
+    return [_row_to_booking(r) for r in rows]
+
+
+def count_upcoming_bookings(now: Optional[datetime] = None) -> int:
+    """Подтверждённые/перенесённые с датой начала не раньше сейчас."""
+    now = now or datetime.now()
+    now_s = now.isoformat(timespec="minutes")
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM bookings b
+            WHERE datetime(b.start_at) >= datetime(?)
+              AND b.status IN ('confirmed', 'rescheduled')
+            """,
+            (now_s,),
+        ).fetchone()
+    return int(row["c"]) if row else 0
+
+
+def list_upcoming_bookings_page(
+    offset: int,
+    limit: int,
+    now: Optional[datetime] = None,
+) -> list[BookingRow]:
+    now = now or datetime.now()
+    now_s = now.isoformat(timespec="minutes")
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT b.id, c.name AS client_name, c.phone, v.make_model, v.license_plate,
+                   b.service, b.master_name, b.start_at, b.status
+            FROM bookings b
+            JOIN clients c ON c.id = b.client_id
+            JOIN vehicles v ON v.id = b.vehicle_id
+            WHERE datetime(b.start_at) >= datetime(?)
+              AND b.status IN ('confirmed', 'rescheduled')
+            ORDER BY datetime(b.start_at) ASC
+            LIMIT ? OFFSET ?
+            """,
+            (now_s, limit, offset),
+        ).fetchall()
+    return [_row_to_booking(r) for r in rows]
+
+
+def count_completed_bookings() -> int:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM bookings WHERE status = 'completed'",
+        ).fetchone()
+    return int(row["c"]) if row else 0
+
+
+def list_completed_bookings_page(offset: int, limit: int) -> list[BookingRow]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT b.id, c.name AS client_name, c.phone, v.make_model, v.license_plate,
+                   b.service, b.master_name, b.start_at, b.status
+            FROM bookings b
+            JOIN clients c ON c.id = b.client_id
+            JOIN vehicles v ON v.id = b.vehicle_id
+            WHERE b.status = 'completed'
+            ORDER BY datetime(b.updated_at) DESC, datetime(b.start_at) DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
         ).fetchall()
     return [_row_to_booking(r) for r in rows]
 
