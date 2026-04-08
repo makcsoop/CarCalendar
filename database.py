@@ -54,6 +54,7 @@ def init_db() -> None:
                 end_at TEXT,
                 status TEXT NOT NULL DEFAULT 'confirmed',
                 admin_telegram_id INTEGER,
+                confirm_key TEXT,
                 google_event_id TEXT,
                 sheet_row INTEGER,
                 notes TEXT,
@@ -71,6 +72,7 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_bookings_start ON bookings(start_at);
             CREATE INDEX IF NOT EXISTS idx_bookings_status ON bookings(status);
             CREATE INDEX IF NOT EXISTS idx_bookings_master ON bookings(master_name);
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_bookings_confirm_key ON bookings(confirm_key);
             """
         )
         _migrate_bookings(conn)
@@ -82,6 +84,9 @@ def _migrate_bookings(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE bookings ADD COLUMN calendar_uid TEXT")
     if "calendar_href" not in cols:
         conn.execute("ALTER TABLE bookings ADD COLUMN calendar_href TEXT")
+    if "confirm_key" not in cols:
+        conn.execute("ALTER TABLE bookings ADD COLUMN confirm_key TEXT")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_bookings_confirm_key ON bookings(confirm_key)")
 
 
 def list_saved_brands() -> list[str]:
@@ -163,12 +168,21 @@ def create_booking(
     master_name: Optional[str] = None,
     duration_minutes: int = 120,
     admin_telegram_id: Optional[int] = None,
+    confirm_key: Optional[str] = None,
     calendar_uid: Optional[str] = None,
     calendar_href: Optional[str] = None,
     notes: Optional[str] = None,
 ) -> int:
     end_at = start_at + timedelta(minutes=duration_minutes)
     with get_conn() as conn:
+        if confirm_key:
+            existing = conn.execute(
+                "SELECT id FROM bookings WHERE confirm_key = ?",
+                (confirm_key,),
+            ).fetchone()
+            if existing:
+                return int(existing["id"])
+
         cur = conn.execute(
             "INSERT INTO clients (name, phone) VALUES (?, ?)",
             (client_name.strip(), phone.strip()),
@@ -183,9 +197,9 @@ def create_booking(
             """
             INSERT INTO bookings (
                 client_id, vehicle_id, service, master_name, start_at, end_at,
-                status, admin_telegram_id, google_event_id, sheet_row, notes,
+                status, admin_telegram_id, confirm_key, google_event_id, sheet_row, notes,
                 calendar_uid, calendar_href
-            ) VALUES (?, ?, ?, ?, ?, ?, 'confirmed', ?, NULL, NULL, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, 'confirmed', ?, ?, NULL, NULL, ?, ?, ?)
             """,
             (
                 client_id,
@@ -195,6 +209,7 @@ def create_booking(
                 start_at.isoformat(timespec="minutes"),
                 end_at.isoformat(timespec="minutes"),
                 admin_telegram_id,
+                confirm_key,
                 notes,
                 calendar_uid,
                 calendar_href,

@@ -1,6 +1,8 @@
 """Клавиатуры Telegram."""
 from __future__ import annotations
 
+from datetime import date as Date, datetime
+
 from telebot import types
 
 from config import SERVICES, TIME_SLOTS
@@ -46,15 +48,52 @@ def services_inline(prefix: str = "svc") -> types.InlineKeyboardMarkup:
     return kb
 
 
-def time_inline(prefix: str = "tm") -> types.InlineKeyboardMarkup:
+def _parse_slot_hhmm(slot: str) -> tuple[int, int] | None:
+    try:
+        h_s, m_s = slot.split(":")
+        return int(h_s), int(m_s)
+    except Exception:
+        return None
+
+
+def time_inline(*, booking_date: str | Date | None = None, now: datetime | None = None) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=3)
+    now = now or datetime.now()
+
+    target: Date | None = None
+    if isinstance(booking_date, Date):
+        target = booking_date
+    elif isinstance(booking_date, str) and booking_date:
+        try:
+            target = Date.fromisoformat(booking_date)
+        except ValueError:
+            target = None
+
+    slots: list[str] = list(TIME_SLOTS)
+    if target is not None and target == now.date():
+        filtered: list[str] = []
+        for s in slots:
+            if s == "Другое":
+                continue
+            hm = _parse_slot_hhmm(s)
+            if hm is None:
+                continue
+            h, m = hm
+            if (h, m) > (now.hour, now.minute):
+                filtered.append(s)
+        if "Другое" in slots:
+            filtered.append("Другое")
+        slots = filtered
+
     row: list[types.InlineKeyboardButton] = []
-    for i, t in enumerate(TIME_SLOTS):
+    for t in slots:
         if t == "Другое":
             label = "✏️ Другое"
+            cb = "tmv:other"
         else:
             label = f"🕐 {t}"
-        row.append(types.InlineKeyboardButton(label, callback_data=f"{prefix}:{i}"))
+            cb = f"tmv:{t}"
+        row.append(types.InlineKeyboardButton(label, callback_data=cb))
         if len(row) == 3:
             kb.row(*row)
             row = []

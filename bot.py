@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
@@ -216,7 +217,9 @@ def apply_skip_date(chat_id: int, state: StateContext) -> None:
         goto_review(state, chat_id)
         return
     state.set(BookingStates.time_pick)
-    chat_ui.send_tracked(bot, chat_id, state, "Время:", reply_markup=time_inline())
+    with state.data() as data:
+        d_iso = data.get("booking_date")
+    chat_ui.send_tracked(bot, chat_id, state, "Время:", reply_markup=time_inline(booking_date=d_iso))
 
 
 def apply_skip_time(chat_id: int, state: StateContext) -> None:
@@ -619,7 +622,13 @@ def cb_date(call: types.CallbackQuery, state: StateContext):
     state.add_data(booking_date=d.isoformat())
     bot.answer_callback_query(call.id)
     state.set(BookingStates.time_pick)
-    chat_ui.send_tracked(bot, call.message.chat.id, state, "Время:", reply_markup=time_inline())
+    chat_ui.send_tracked(
+        bot,
+        call.message.chat.id,
+        state,
+        "Время:",
+        reply_markup=time_inline(booking_date=d.isoformat()),
+    )
 
 
 @bot.message_handler(state=BookingStates.date_text)
@@ -648,10 +657,16 @@ def step_date_text(message: types.Message, state: StateContext):
             message.chat.id,
             state,
             "Выберите новое время:",
-            reply_markup=time_inline(),
+            reply_markup=time_inline(booking_date=d.isoformat()),
         )
     state.set(BookingStates.time_pick)
-    chat_ui.send_tracked(bot, message.chat.id, state, "Время:", reply_markup=time_inline())
+    chat_ui.send_tracked(
+        bot,
+        message.chat.id,
+        state,
+        "Время:",
+        reply_markup=time_inline(booking_date=d.isoformat()),
+    )
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "skp:tm", state=BookingStates.time_pick)
@@ -663,12 +678,20 @@ def cb_skip_time(call: types.CallbackQuery, state: StateContext):
     apply_skip_time(call.message.chat.id, state)
 
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("tm:"), state=BookingStates.time_pick)
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("tm:") or c.data.startswith("tmv:"),
+    state=BookingStates.time_pick,
+)
 def cb_time(call: types.CallbackQuery, state: StateContext):
     if not is_admin(call.from_user.id):
         return bot.answer_callback_query(call.id)
-    idx = int(call.data.split(":")[1])
-    slot = TIME_SLOTS[idx]
+    if call.data.startswith("tmv:"):
+        slot = call.data.split(":", 1)[1]
+        if slot == "other":
+            slot = "Другое"
+    else:
+        idx = int(call.data.split(":")[1])
+        slot = TIME_SLOTS[idx]
     chat_ui.delete_callback_message(bot, call.message.chat.id, call.message.message_id)
     if slot == "Другое":
         state.set(BookingStates.time_text)
@@ -744,9 +767,22 @@ def cb_confirm(call: types.CallbackQuery, state: StateContext):
     if action != "ok":
         return
     with state.data() as data:
+        if data.get("confirm_in_flight"):
+            return
+    state.add_data(confirm_in_flight=True)
+    try:
+        bot.edit_message_reply_markup(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+    with state.data() as data:
         d_iso = data.get("booking_date")
         bt = data.get("booking_time")
         if not d_iso or bt is None:
+            state.add_data(confirm_in_flight=False)
             return bot.send_message(
                 call.message.chat.id,
                 "Чтобы сохранить запись, укажите дату и время: «Изменить» → «Дата/время».",
@@ -769,6 +805,7 @@ def cb_confirm(call: types.CallbackQuery, state: StateContext):
             "service": data.get("service") or SERVICE_SKIPPED,
             "start_at": start_at,
         }
+    confirm_key = f"{call.message.chat.id}:{call.message.message_id}"
     bid = db.create_booking(
         client_name=payload["client_name"],
         phone=payload["phone"],
@@ -778,9 +815,32 @@ def cb_confirm(call: types.CallbackQuery, state: StateContext):
         license_plate="",
         master_name=None,
         admin_telegram_id=call.from_user.id,
+        confirm_key=confirm_key,
     )
-    cal_err: Optional[str] = None
+    chat_ui.purge_tracked(bot, call.message.chat.id, state)
+    state.delete()
+    lines = [
+        "Запись сохранена.",
+        f"ID: {bid}",
+        draft_lines(
+            {
+                **payload,
+                "booking_date": payload["start_at"].date().isoformat(),
+                "booking_time": (payload["start_at"].hour, payload["start_at"].minute),
+            }
+        ),
+    ]
     if yandex_calendar.is_configured():
+        lines.append("Календарь: добавляю событие…")
+    else:
+        lines.append("Календарь: Яндекс.Календарь не настроен — только SQLite.")
+    bot.send_message(call.message.chat.id, "\n".join(lines), reply_markup=main_menu())
+
+    if not yandex_calendar.is_configured():
+        return
+
+    def _calendar_job() -> None:
+        cal_err: Optional[str] = None
         try:
             desc = (
                 f"Тел: {payload['phone']}\n"
@@ -799,27 +859,15 @@ def cb_confirm(call: types.CallbackQuery, state: StateContext):
         except Exception as e:  # noqa: BLE001
             log.exception("yandex calendar")
             cal_err = str(e)
-    else:
-        cal_err = "Яндекс.Календарь не настроен — только SQLite."
+        try:
+            if cal_err:
+                bot.send_message(call.message.chat.id, f"Календарь: ошибка добавления события: {cal_err}")
+            else:
+                bot.send_message(call.message.chat.id, f"Календарь: событие добавлено. ID записи: {bid}")
+        except Exception:
+            pass
 
-    chat_ui.purge_tracked(bot, call.message.chat.id, state)
-    state.delete()
-    lines = [
-        "Запись сохранена.",
-        f"ID: {bid}",
-        draft_lines(
-            {
-                **payload,
-                "booking_date": payload["start_at"].date().isoformat(),
-                "booking_time": (payload["start_at"].hour, payload["start_at"].minute),
-            }
-        ),
-    ]
-    if cal_err:
-        lines.append(f"Календарь: {cal_err}")
-    else:
-        lines.append("Событие добавлено в Яндекс.Календарь.")
-    bot.send_message(call.message.chat.id, "\n".join(lines), reply_markup=main_menu())
+    threading.Thread(target=_calendar_job, daemon=True).start()
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("ed:"), state=BookingStates.pick_edit)
