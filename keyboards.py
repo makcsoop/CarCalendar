@@ -8,7 +8,7 @@ from telebot import types
 from config import SERVICES, TIME_SLOTS
 
 # Эмодзи для услуг (по порядку с config.SERVICES)
-_SVC_EMOJI = ["✨", "🛡️", "🧼", "📏", "🫧", "➕"]
+_SVC_EMOJI = ["🛡️", "🎨", "🔧", "🪟", "🩹", "🌫️", "🔇", "🚪", "💡", "✨", "📌", "⚙️"]
 
 
 def main_menu() -> types.ReplyKeyboardMarkup:
@@ -36,14 +36,17 @@ def skip_or_cancel_reply() -> types.ReplyKeyboardMarkup:
     return kb
 
 
-def services_inline(prefix: str = "svc") -> types.InlineKeyboardMarkup:
+def services_inline(prefix: str = "svc", selected: set[int] | None = None) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=2)
+    selected = selected or set()
     for i, s in enumerate(SERVICES):
         icon = _SVC_EMOJI[i] if i < len(_SVC_EMOJI) else "🔧"
-        label = f"{icon} {s}"
+        marker = "🟩" if i in selected else "⬜"
+        label = f"{marker} {icon} {s}"
         if len(label) > 64:
             label = (s if len(s) <= 64 else s[:61] + "…")
         kb.add(types.InlineKeyboardButton(label, callback_data=f"{prefix}:{i}"))
+    kb.row(types.InlineKeyboardButton(f"✅ Готово ({len(selected)})", callback_data=f"{prefix}:done"))
     kb.row(types.InlineKeyboardButton("⏭️ Пропустить", callback_data="skp:sv"))
     return kb
 
@@ -166,6 +169,7 @@ def report_menu_inline() -> types.InlineKeyboardMarkup:
         ("🌅 Все записи на завтра", "rp:tm"),
         ("✅ Выполнено сегодня", "rp:cd"),
         ("📊 За текущий месяц (сводка)", "rp:mo"),
+        ("🚗 Частые авто (приходят и обрабатываются)", "rp:ca"),
         ("🚶 Не пришли за 2 недели", "rp:ns"),
         ("📂 Незакрытые и отменённые", "rp:op"),
         ("👥 Новые / повторные клиенты (месяц)", "rp:st"),

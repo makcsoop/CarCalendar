@@ -86,6 +86,22 @@ def report_client_stats_month() -> str:
     )
 
 
+def report_popular_cars() -> str:
+    top_all = db.popular_cars(limit=10, only_processed=False)
+    top_done = db.popular_cars(limit=10, only_processed=True)
+    if not top_all and not top_done:
+        return "Данных по авто пока нет."
+    all_lines = "\n".join(f"• {car}: {cnt}" for car, cnt in top_all) or "—"
+    done_lines = "\n".join(f"• {car}: {cnt}" for car, cnt in top_done) or "—"
+    return (
+        "Наиболее частые авто:\n\n"
+        "Приходят (все записи):\n"
+        f"{all_lines}\n\n"
+        "Обрабатываются (статус «выполнена»):\n"
+        f"{done_lines}"
+    )
+
+
 def run_parsed(kind: str) -> str:
     if kind == "week_count":
         return report_week_count()
@@ -101,4 +117,6 @@ def run_parsed(kind: str) -> str:
         return report_open_cancelled()
     if kind == "client_stats_month":
         return report_client_stats_month()
+    if kind == "cars_popular":
+        return report_popular_cars()
     return "Неизвестный тип отчёта."

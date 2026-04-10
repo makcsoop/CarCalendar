@@ -150,7 +150,7 @@ def draft_lines(data: dict[str, Any]) -> str:
         f"Клиент: {data.get('client_name', '—')}\n"
         f"Телефон: {data.get('phone', '—')}\n"
         f"Авто: {data.get('make_model', '—')}\n"
-        f"Услуга: {data.get('service', '—')}\n"
+        f"Услуги: {data.get('service', '—')}\n"
         f"Дата и время: {dt_s}"
     )
 
@@ -198,10 +198,28 @@ def _pop_state_keys(state: StateContext, *keys: str) -> None:
             data.pop(k, None)
 
 
+def _service_indices_from_text(raw: str) -> set[int]:
+    text = (raw or "").strip()
+    if not text or text == SERVICE_SKIPPED:
+        return set()
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    svc_to_idx = {name: i for i, name in enumerate(SERVICES)}
+    return {svc_to_idx[p] for p in parts if p in svc_to_idx}
+
+
+def _services_text_from_indices(indices: set[int]) -> str:
+    if not indices:
+        return SERVICE_SKIPPED
+    ordered = sorted(i for i in indices if 0 <= i < len(SERVICES))
+    if not ordered:
+        return SERVICE_SKIPPED
+    return ", ".join(SERVICES[i] for i in ordered)
+
+
 def apply_skip_service(chat_id: int, state: StateContext) -> None:
     with state.data() as data:
         ret = data.get("return_to_review")
-    state.add_data(service=SERVICE_SKIPPED)
+    state.add_data(service=SERVICE_SKIPPED, selected_services=[])
     if ret:
         goto_review(state, chat_id)
         return
@@ -497,12 +515,13 @@ def cb_model(call: types.CallbackQuery, state: StateContext):
     if ret:
         return goto_review(state, call.message.chat.id)
     state.set(BookingStates.service)
+    state.add_data(selected_services=[])
     return chat_ui.send_tracked(
         bot,
         call.message.chat.id,
         state,
-        "Выберите услугу:",
-        reply_markup=services_inline(),
+        "Выберите одну или несколько услуг и нажмите «Готово»:",
+        reply_markup=services_inline(selected=set()),
     )
 
 
@@ -553,12 +572,13 @@ def step_car_model_custom(message: types.Message, state: StateContext):
     if ret:
         return goto_review(state, message.chat.id)
     state.set(BookingStates.service)
+    state.add_data(selected_services=[])
     chat_ui.send_tracked(
         bot,
         message.chat.id,
         state,
-        "Выберите услугу:",
-        reply_markup=services_inline(),
+        "Выберите одну или несколько услуг и нажмите «Готово»:",
+        reply_markup=services_inline(selected=set()),
     )
 
 
@@ -575,17 +595,44 @@ def cb_skip_service(call: types.CallbackQuery, state: StateContext):
 def cb_service(call: types.CallbackQuery, state: StateContext):
     if not is_admin(call.from_user.id):
         return bot.answer_callback_query(call.id)
-    idx = int(call.data.split(":")[1])
-    svc = SERVICES[idx]
+    part = call.data.split(":")[1]
     with state.data() as data:
         ret = data.get("return_to_review")
-    state.add_data(service=svc)
-    chat_ui.delete_callback_message(bot, call.message.chat.id, call.message.message_id)
+        existing = data.get("selected_services")
+        if isinstance(existing, list):
+            selected = {int(i) for i in existing if isinstance(i, int)}
+        else:
+            selected = _service_indices_from_text(str(data.get("service") or ""))
+    if part == "done":
+        if not selected:
+            return bot.answer_callback_query(call.id, "Выберите хотя бы одну услугу", show_alert=False)
+        state.add_data(service=_services_text_from_indices(selected), selected_services=sorted(selected))
+        chat_ui.delete_callback_message(bot, call.message.chat.id, call.message.message_id)
+        bot.answer_callback_query(call.id)
+        if ret:
+            return goto_review(state, call.message.chat.id)
+        state.set(BookingStates.date_pick)
+        return chat_ui.send_tracked(
+            bot, call.message.chat.id, state, "Дата записи:", reply_markup=date_inline()
+        )
+    try:
+        idx = int(part)
+    except ValueError:
+        return bot.answer_callback_query(call.id)
+    if idx < 0 or idx >= len(SERVICES):
+        return bot.answer_callback_query(call.id)
+    if idx in selected:
+        selected.remove(idx)
+    else:
+        selected.add(idx)
+    state.add_data(selected_services=sorted(selected))
     bot.answer_callback_query(call.id)
-    if ret:
-        return goto_review(state, call.message.chat.id)
-    state.set(BookingStates.date_pick)
-    chat_ui.send_tracked(bot, call.message.chat.id, state, "Дата записи:", reply_markup=date_inline())
+    bot.edit_message_reply_markup(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=services_inline(selected=selected),
+    )
+    return
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "skp:dt", state=BookingStates.date_pick)
@@ -817,6 +864,8 @@ def cb_confirm(call: types.CallbackQuery, state: StateContext):
         admin_telegram_id=call.from_user.id,
         confirm_key=confirm_key,
     )
+    # Дублируем явное удаление сообщения проверки, чтобы оно не оставалось в чате.
+    chat_ui.delete_callback_message(bot, call.message.chat.id, call.message.message_id)
     chat_ui.purge_tracked(bot, call.message.chat.id, state)
     state.delete()
     lines = [
@@ -891,14 +940,21 @@ def cb_edit_menu(call: types.CallbackQuery, state: StateContext):
         "nm": "Новое имя клиента (или «Пропустить»):",
         "ph": "Новый телефон (или «Пропустить»):",
         "cr": "Выберите марку и модель:",
-        "sv": "Выберите услугу:",
+        "sv": "Выберите одну или несколько услуг и нажмите «Готово»:",
     }
     if code not in mapping:
         return
     state.set(mapping[code])
     if code == "sv":
+        with state.data() as data:
+            selected = _service_indices_from_text(str(data.get("service") or ""))
+        state.add_data(selected_services=sorted(selected))
         return chat_ui.send_tracked(
-            bot, call.message.chat.id, state, prompts[code], reply_markup=services_inline()
+            bot,
+            call.message.chat.id,
+            state,
+            prompts[code],
+            reply_markup=services_inline(selected=selected),
         )
     if code == "dt":
         return chat_ui.send_tracked(
@@ -955,6 +1011,7 @@ def cb_report(call: types.CallbackQuery, state: StateContext):
         "tm": "tomorrow_list",
         "cd": "completed_today",
         "mo": "month_summary",
+        "ca": "cars_popular",
         "ns": "no_show_2w",
         "op": "open_cancelled",
         "st": "client_stats_month",

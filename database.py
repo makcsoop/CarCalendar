@@ -629,3 +629,25 @@ def client_stats_between(start: datetime, end: datetime) -> tuple[int, int]:
     new_c = int(new_rows["c"]) if new_rows else 0
     total = int(total_clients["c"]) if total_clients else 0
     return new_c, max(0, total - new_c)
+
+
+def popular_cars(limit: int = 10, *, only_processed: bool = False) -> list[tuple[str, int]]:
+    """
+    Топ авто по полю vehicles.make_model.
+    only_processed=True -> только записи со статусом completed.
+    """
+    where = "WHERE b.status = 'completed'" if only_processed else ""
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT v.make_model AS make_model, COUNT(*) AS c
+            FROM bookings b
+            JOIN vehicles v ON v.id = b.vehicle_id
+            {where}
+            GROUP BY v.make_model
+            ORDER BY c DESC, v.make_model COLLATE NOCASE ASC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+    return [(r["make_model"], int(r["c"])) for r in rows]

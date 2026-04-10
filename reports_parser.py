@@ -31,4 +31,6 @@ def parse_report_message(text: str) -> Optional[ParsedReport]:
         return ParsedReport("open_cancelled")
     if re.search(r"нов(ый|ые|ых)?\s+клиент|повторн", t):
         return ParsedReport("client_stats_month")
+    if re.search(r"част(ые|о)|топ", t) and re.search(r"авто|машин|модель", t):
+        return ParsedReport("cars_popular")
     return None

@@ -65,6 +65,8 @@ def send_tracked(
                 disable_notification=True,
             )
             remove_msg_id = rm.message_id
+            # Добавляем во временный трек: если не получится удалить сразу, удалим позже purge-ом.
+            ids.append(remove_msg_id)
         except Exception as e:  # noqa: BLE001
             log.debug("ReplyKeyboardRemove: %s", e)
 
@@ -72,6 +74,7 @@ def send_tracked(
     if remove_msg_id is not None:
         try:
             bot.delete_message(chat_id, remove_msg_id)
+            ids = [mid for mid in ids if mid != remove_msg_id]
         except Exception as e:  # noqa: BLE001
             log.debug("delete_message after ReplyKeyboardRemove: %s", e)
     ids.append(msg.message_id)
