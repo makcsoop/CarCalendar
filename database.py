@@ -130,6 +130,38 @@ def add_saved_model(brand_name: str, model_name: str) -> None:
         )
 
 
+def delete_saved_brand(name: str) -> None:
+    n = name.strip()
+    if len(n) < 2:
+        return
+    with get_conn() as conn:
+        conn.execute("DELETE FROM saved_models WHERE brand_name = ?", (n,))
+        conn.execute("DELETE FROM saved_brands WHERE name = ?", (n,))
+
+
+def delete_saved_model(brand_name: str, model_name: str) -> None:
+    b = brand_name.strip()
+    m = model_name.strip()
+    if len(b) < 1 or len(m) < 1:
+        return
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM saved_models WHERE brand_name = ? AND model_name = ?",
+            (b, m),
+        )
+
+
+def list_brands_with_saved_models() -> list[str]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT brand_name FROM saved_models
+            ORDER BY brand_name COLLATE NOCASE
+            """
+        ).fetchall()
+    return [r["brand_name"] for r in rows]
+
+
 @dataclass
 class BookingRow:
     id: int

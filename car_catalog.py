@@ -25,8 +25,17 @@ def merged_brands_list() -> list[str]:
     return merged
 
 
+def _is_config_brand(brand: str) -> bool:
+    """Марки из config.CAR_BRANDS — с пресетами моделей; своя марка — только сохранённые модели."""
+    b = brand.casefold()
+    return any(x.casefold() == b for x in CAR_BRANDS)
+
+
 def models_for_brand(brand: str) -> list[str]:
-    presets = MODELS_BY_BRAND.get(brand) or MODELS_BY_BRAND.get("_default", [])
+    if _is_config_brand(brand):
+        presets = MODELS_BY_BRAND.get(brand) or MODELS_BY_BRAND.get("_default", [])
+    else:
+        presets = []
     saved = db.list_saved_models(brand)
     out: list[str] = []
     seen: set[str] = set()

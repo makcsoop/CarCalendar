@@ -30,6 +30,10 @@ from keyboards import (
     bookings_carousel_inline,
     brands_inline,
     cancel_reply,
+    catalog_brands_for_models_delete_inline,
+    catalog_models_delete_inline,
+    catalog_saved_brands_delete_inline,
+    catalog_settings_root_inline,
     confirm_inline,
     date_inline,
     edit_field_inline,
@@ -63,8 +67,15 @@ BOOKING_SLOT_MINUTES = 120
 BTN_NEW = "📝 Новая запись"
 BTN_REPORTS = "📊 Отчёты"
 BTN_STATUS = "📋 Статус записи"
-BTN_HELP = "❓ Помощь"
+BTN_SETTINGS = "⚙️ Настройки"
 BTN_CANCEL = "⏹️ Отмена"
+
+SETTINGS_CATALOG_TEXT = (
+    "⚙️ Каталог марок и моделей\n\n"
+    "Здесь можно удалить сохранённые марки и модели (то, что попало в быстрый выбор). "
+    "Новую марку по-прежнему добавляете через «Другое (ввести марку)» при записи.\n\n"
+    "Выберите действие:"
+)
 
 
 def is_skip_text(text: str) -> bool:
@@ -281,6 +292,7 @@ def cmd_start(message: types.Message, state: StateContext):
         "• 📝 Новая запись — пошаговый ввод с кнопками.\n"
         "• 📊 Отчёты — меню или напишите запрос текстом.\n"
         "• 📋 Статус записи — смена статуса (предстоящие / завершённые).\n"
+        "• ⚙️ Настройки — удаление сохранённых марок и моделей из быстрого выбора.\n"
         "/cancel — сбросить текущий шаг.",
         reply_markup=main_menu(),
     )
@@ -321,20 +333,158 @@ def reply_skip_while_inline_step(message: types.Message, state: StateContext):
         return apply_skip_time(message.chat.id, state)
 
 
-@bot.message_handler(func=lambda m: (m.text or "").strip() == BTN_HELP)
-def help_btn(message: types.Message, state: StateContext):
+@bot.message_handler(func=lambda m: (m.text or "").strip() == BTN_SETTINGS)
+def settings_btn(message: types.Message, state: StateContext):
     if not is_admin(message.from_user.id):
         return access_denied(message.chat.id)
+    chat_ui.purge_tracked(bot, message.chat.id, state)
     state.delete()
     bot.send_message(
         message.chat.id,
-        "Бот записи детейлинга.\n"
-        "• 📝 Новая запись — пошаговый ввод с кнопками.\n"
-        "• 📊 Отчёты — меню или свой текстовый запрос.\n"
-        "• 📋 Статус записи — предстоящие и завершённые записи, смена статуса.\n"
-        "/cancel — сбросить текущий шаг.",
-        reply_markup=main_menu(),
+        SETTINGS_CATALOG_TEXT,
+        reply_markup=catalog_settings_root_inline(),
     )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("cd:"))
+def cb_catalog_settings(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return bot.answer_callback_query(call.id)
+    parts = call.data.split(":")
+    op = parts[1] if len(parts) > 1 else ""
+    chat_id = call.message.chat.id
+    mid = call.message.message_id
+
+    def edit(text: str, markup: types.InlineKeyboardMarkup) -> None:
+        bot.edit_message_text(text, chat_id=chat_id, message_id=mid, reply_markup=markup)
+
+    try:
+        if op == "close":
+            bot.answer_callback_query(call.id)
+            try:
+                bot.delete_message(chat_id, mid)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        if op == "home":
+            bot.answer_callback_query(call.id)
+            edit(SETTINGS_CATALOG_TEXT, catalog_settings_root_inline())
+            return
+        if op == "delbr":
+            brands = db.list_saved_brands()
+            bot.answer_callback_query(call.id)
+            if not brands:
+                edit(
+                    "Сохранённых марок нет. Добавьте свою марку через "
+                    "«Другое (ввести марку)» при новой записи.",
+                    catalog_settings_root_inline(),
+                )
+                return
+            edit(
+                "Выберите марку для удаления (вместе с её сохранёнными моделями):",
+                catalog_saved_brands_delete_inline(brands),
+            )
+            return
+        if op == "db" and len(parts) >= 3:
+            brands = db.list_saved_brands()
+            try:
+                idx = int(parts[2])
+            except ValueError:
+                return bot.answer_callback_query(call.id, "Ошибка", show_alert=True)
+            if idx < 0 or idx >= len(brands):
+                return bot.answer_callback_query(call.id, "Список устарел, откройте настройки снова.", show_alert=True)
+            name = brands[idx]
+            db.delete_saved_brand(name)
+            bot.answer_callback_query(call.id, f"Удалено: {name}")
+            brands = db.list_saved_brands()
+            if not brands:
+                edit(
+                    "Марка удалена. Сохранённых марок больше нет.",
+                    catalog_settings_root_inline(),
+                )
+            else:
+                edit(
+                    "Выберите марку для удаления (вместе с её сохранёнными моделями):",
+                    catalog_saved_brands_delete_inline(brands),
+                )
+            return
+        if op == "delmd":
+            bwl = db.list_brands_with_saved_models()
+            bot.answer_callback_query(call.id)
+            if not bwl:
+                edit(
+                    "Нет сохранённых моделей. Они появляются после ввода своей модели "
+                    "или выбора из списка (сохраняются в каталог).",
+                    catalog_settings_root_inline(),
+                )
+                return
+            edit(
+                "Выберите марку — покажем сохранённые для неё модели:",
+                catalog_brands_for_models_delete_inline(bwl),
+            )
+            return
+        if op == "mb" and len(parts) >= 3:
+            bwl = db.list_brands_with_saved_models()
+            try:
+                idx = int(parts[2])
+            except ValueError:
+                return bot.answer_callback_query(call.id, "Ошибка", show_alert=True)
+            if idx < 0 or idx >= len(bwl):
+                return bot.answer_callback_query(call.id, "Список устарел, откройте настройки снова.", show_alert=True)
+            brand = bwl[idx]
+            models = db.list_saved_models(brand)
+            bot.answer_callback_query(call.id)
+            if not models:
+                edit(
+                    "У этой марки нет сохранённых моделей.",
+                    catalog_brands_for_models_delete_inline(bwl),
+                )
+                return
+            edit(
+                f"Марка: {brand}\n\nСохранённые модели — нажмите, чтобы удалить:",
+                catalog_models_delete_inline(idx, models),
+            )
+            return
+        if op == "dm" and len(parts) >= 4:
+            bwl = db.list_brands_with_saved_models()
+            try:
+                bi = int(parts[2])
+                mi = int(parts[3])
+            except ValueError:
+                return bot.answer_callback_query(call.id, "Ошибка", show_alert=True)
+            if bi < 0 or bi >= len(bwl):
+                return bot.answer_callback_query(call.id, "Список устарел, откройте настройки снова.", show_alert=True)
+            brand = bwl[bi]
+            models = db.list_saved_models(brand)
+            if mi < 0 or mi >= len(models):
+                return bot.answer_callback_query(call.id, "Список устарел, откройте настройки снова.", show_alert=True)
+            model = models[mi]
+            db.delete_saved_model(brand, model)
+            bot.answer_callback_query(call.id, f"Удалено: {model}")
+            models = db.list_saved_models(brand)
+            if not models:
+                bwl = db.list_brands_with_saved_models()
+                if not bwl:
+                    edit(
+                        "Модель удалена. Сохранённых моделей больше нет.",
+                        catalog_settings_root_inline(),
+                    )
+                else:
+                    edit(
+                        "Выберите марку — покажем сохранённые для неё модели:",
+                        catalog_brands_for_models_delete_inline(bwl),
+                    )
+            else:
+                edit(
+                    f"Марка: {brand}\n\nСохранённые модели — нажмите, чтобы удалить:",
+                    catalog_models_delete_inline(bi, models),
+                )
+            return
+    except Exception as e:  # noqa: BLE001
+        log.warning("catalog settings edit: %s", e)
+        bot.answer_callback_query(call.id, "Не удалось обновить меню.", show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
 
 
 @bot.message_handler(func=lambda m: (m.text or "").strip() == BTN_NEW)

@@ -19,7 +19,7 @@ def main_menu() -> types.ReplyKeyboardMarkup:
     )
     kb.add(
         types.KeyboardButton("📋 Статус записи"),
-        types.KeyboardButton("❓ Помощь"),
+        types.KeyboardButton("⚙️ Настройки"),
     )
     return kb
 
@@ -234,4 +234,45 @@ def bookings_carousel_inline(
             )
         kb.row(*nav)
     kb.row(types.InlineKeyboardButton("🔙 К разделам", callback_data="slm:menu"))
+    return kb
+
+
+def catalog_settings_root_inline() -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("🗑 Удалить сохранённую марку", callback_data="cd:delbr"),
+        types.InlineKeyboardButton("🗑 Удалить сохранённую модель", callback_data="cd:delmd"),
+        types.InlineKeyboardButton("✖️ Закрыть", callback_data="cd:close"),
+    )
+    return kb
+
+
+def catalog_saved_brands_delete_inline(brands: list[str]) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for i, b in enumerate(brands):
+        short = b if len(b) <= 40 else b[:37] + "…"
+        kb.add(types.InlineKeyboardButton(f"🗑 {short}", callback_data=f"cd:db:{i}"))
+    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="cd:home"))
+    return kb
+
+
+def catalog_brands_for_models_delete_inline(brands: list[str]) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for i, b in enumerate(brands):
+        short = b if len(b) <= 40 else b[:37] + "…"
+        kb.add(types.InlineKeyboardButton(short, callback_data=f"cd:mb:{i}"))
+    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="cd:home"))
+    return kb
+
+
+def catalog_models_delete_inline(brand_idx: int, models: list[str]) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for mi, m in enumerate(models):
+        short = m if len(m) <= 36 else m[:33] + "…"
+        kb.add(
+            types.InlineKeyboardButton(
+                f"🗑 {short}", callback_data=f"cd:dm:{brand_idx}:{mi}"
+            )
+        )
+    kb.add(types.InlineKeyboardButton("🔙 К маркам", callback_data="cd:delmd"))
     return kb
