@@ -22,6 +22,7 @@ def _parse_admin_ids(raw: str | None) -> set[int]:
             out.add(int(part))
         except ValueError:
             continue
+    print(out)
     return out
 
 
