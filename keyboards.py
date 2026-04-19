@@ -5,10 +5,7 @@ from datetime import date as Date, datetime
 
 from telebot import types
 
-from config import SERVICES, TIME_SLOTS
-
-# Эмодзи для услуг (по порядку с config.SERVICES)
-_SVC_EMOJI = ["🛡️", "🎨", "🔧", "🪟", "🩹", "🌫️", "🔇", "🚪", "💡", "✨", "📌", "⚙️"]
+from config import TIME_SLOTS
 
 
 def main_menu() -> types.ReplyKeyboardMarkup:
@@ -36,19 +33,53 @@ def skip_or_cancel_reply() -> types.ReplyKeyboardMarkup:
     return kb
 
 
-def services_inline(prefix: str = "svc", selected: set[int] | None = None) -> types.InlineKeyboardMarkup:
+def services_inline(
+    service_catalog: list[tuple[str, list[str]]],
+    *,
+    prefix: str = "svc",
+    selected: set[str] | None = None,
+    active_section_idx: int | None = None,
+) -> tuple[types.InlineKeyboardMarkup, list[str]]:
     kb = types.InlineKeyboardMarkup(row_width=2)
     selected = selected or set()
-    for i, s in enumerate(SERVICES):
-        icon = _SVC_EMOJI[i] if i < len(_SVC_EMOJI) else "🔧"
-        marker = "🟩" if i in selected else "⬜"
-        label = f"{marker} {icon} {s}"
-        if len(label) > 64:
-            label = (s if len(s) <= 64 else s[:61] + "…")
-        kb.add(types.InlineKeyboardButton(label, callback_data=f"{prefix}:{i}"))
+    options: list[str] = []
+    option_idx = 0
+
+    is_section_mode = active_section_idx is not None and 0 <= active_section_idx < len(service_catalog)
+    if is_section_mode:
+        section_name, services = service_catalog[active_section_idx]
+        kb.row(types.InlineKeyboardButton(f"📂 {section_name}", callback_data=f"{prefix}:noop"))
+        for service_name in services:
+            marker = "🟩" if service_name in selected else "⬜"
+            label = f"{marker} {service_name}"
+            if len(label) > 64:
+                label = (service_name if len(service_name) <= 64 else service_name[:61] + "…")
+            kb.add(types.InlineKeyboardButton(label, callback_data=f"{prefix}:{option_idx}"))
+            options.append(service_name)
+            option_idx += 1
+        nav: list[types.InlineKeyboardButton] = []
+        if active_section_idx > 0:
+            nav.append(
+                types.InlineKeyboardButton("◀️ Назад", callback_data=f"{prefix}:nav:{active_section_idx - 1}")
+            )
+        if active_section_idx < len(service_catalog) - 1:
+            nav.append(
+                types.InlineKeyboardButton("Вперёд ▶️", callback_data=f"{prefix}:nav:{active_section_idx + 1}")
+            )
+        if nav:
+            kb.row(*nav)
+        kb.row(types.InlineKeyboardButton("🔙 К разделам", callback_data=f"{prefix}:all"))
+    else:
+        for sec_idx, (section_name, services) in enumerate(service_catalog):
+            kb.row(types.InlineKeyboardButton(f"📂 {section_name}", callback_data=f"{prefix}:sec:{sec_idx}"))
+
     kb.row(types.InlineKeyboardButton(f"✅ Готово ({len(selected)})", callback_data=f"{prefix}:done"))
+    kb.row(
+        types.InlineKeyboardButton("➕ Добавить раздел", callback_data=f"{prefix}:addsec"),
+        types.InlineKeyboardButton("➕ Добавить услугу", callback_data=f"{prefix}:addsvc"),
+    )
     kb.row(types.InlineKeyboardButton("⏭️ Пропустить", callback_data="skp:sv"))
-    return kb
+    return kb, options
 
 
 def _parse_slot_hhmm(slot: str) -> tuple[int, int] | None:
@@ -134,6 +165,7 @@ def models_inline(models: list[str], prefix: str = "md") -> types.InlineKeyboard
         label = m if len(m) <= 40 else m[:37] + "…"
         kb.add(types.InlineKeyboardButton(label, callback_data=f"{prefix}:{i}"))
     kb.add(types.InlineKeyboardButton("✏️ Своя модель", callback_data=f"{prefix}:c"))
+    kb.add(types.InlineKeyboardButton("⏭️ Пропустить", callback_data="skp:md"))
     return kb
 
 

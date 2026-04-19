@@ -23,7 +23,6 @@ from config import (
     ADMIN_TELEGRAM_IDS,
     BOT_TOKEN,
     BRAND_OTHER_LABEL,
-    SERVICES,
     TIME_SLOTS,
 )
 from keyboards import (
@@ -104,6 +103,8 @@ class BookingStates(StatesGroup):
     car_model = State()
     car_model_custom = State()
     service = State()
+    service_section_custom = State()
+    service_custom = State()
     date_pick = State()
     date_text = State()
     time_pick = State()
@@ -209,22 +210,38 @@ def _pop_state_keys(state: StateContext, *keys: str) -> None:
             data.pop(k, None)
 
 
-def _service_indices_from_text(raw: str) -> set[int]:
+def _service_names_from_text(raw: str) -> set[str]:
     text = (raw or "").strip()
     if not text or text == SERVICE_SKIPPED:
         return set()
-    parts = [p.strip() for p in text.split(",") if p.strip()]
-    svc_to_idx = {name: i for i, name in enumerate(SERVICES)}
-    return {svc_to_idx[p] for p in parts if p in svc_to_idx}
+    return {p.strip() for p in text.split(",") if p.strip()}
 
 
-def _services_text_from_indices(indices: set[int]) -> str:
-    if not indices:
+def _services_text_from_names(service_names: set[str]) -> str:
+    if not service_names:
         return SERVICE_SKIPPED
-    ordered = sorted(i for i in indices if 0 <= i < len(SERVICES))
-    if not ordered:
-        return SERVICE_SKIPPED
-    return ", ".join(SERVICES[i] for i in ordered)
+    return ", ".join(sorted(service_names, key=lambda s: s.casefold()))
+
+
+def _current_service_catalog() -> list[tuple[str, list[str]]]:
+    return db.list_service_catalog()
+
+
+def _send_service_picker(chat_id: int, state: StateContext, text: str) -> None:
+    with state.data() as data:
+        existing = data.get("selected_services")
+        selected = {str(v) for v in existing} if isinstance(existing, list) else set()
+        active_section_idx = data.get("service_view_section_idx")
+    if not isinstance(active_section_idx, int):
+        active_section_idx = None
+    service_catalog = _current_service_catalog()
+    kb, options = services_inline(
+        service_catalog,
+        selected=selected,
+        active_section_idx=active_section_idx,
+    )
+    state.add_data(service_options=options, service_view_section_idx=active_section_idx)
+    chat_ui.send_tracked(bot, chat_id, state, text, reply_markup=kb)
 
 
 def apply_skip_service(chat_id: int, state: StateContext) -> None:
@@ -236,6 +253,18 @@ def apply_skip_service(chat_id: int, state: StateContext) -> None:
         return
     state.set(BookingStates.date_pick)
     chat_ui.send_tracked(bot, chat_id, state, "Дата записи:", reply_markup=date_inline())
+
+
+def apply_skip_model(chat_id: int, state: StateContext) -> None:
+    with state.data() as data:
+        ret = data.get("return_to_review")
+    state.add_data(make_model=FIELD_SKIPPED)
+    if ret:
+        goto_review(state, chat_id)
+        return
+    state.set(BookingStates.service)
+    state.add_data(selected_services=[], service_view_section_idx=None)
+    _send_service_picker(chat_id, state, "Выберите одну или несколько услуг и нажмите «Готово»:")
 
 
 def apply_skip_date(chat_id: int, state: StateContext) -> None:
@@ -318,13 +347,15 @@ def reply_cancel(message: types.Message, state: StateContext):
 
 @bot.message_handler(
     func=lambda m: is_skip_text(m.text or ""),
-    state=[BookingStates.service, BookingStates.date_pick, BookingStates.time_pick],
+    state=[BookingStates.car_model, BookingStates.service, BookingStates.date_pick, BookingStates.time_pick],
 )
 def reply_skip_while_inline_step(message: types.Message, state: StateContext):
     """«Пропустить» с reply-клавиатуры на шагах, где основной ввод — inline (клавиатура с прошлого шага)."""
     if not is_admin(message.from_user.id):
         return access_denied(message.chat.id)
     cur = state.get()
+    if cur == BookingStates.car_model.name:
+        return apply_skip_model(message.chat.id, state)
     if cur == BookingStates.service.name:
         return apply_skip_service(message.chat.id, state)
     if cur == BookingStates.date_pick.name:
@@ -665,14 +696,18 @@ def cb_model(call: types.CallbackQuery, state: StateContext):
     if ret:
         return goto_review(state, call.message.chat.id)
     state.set(BookingStates.service)
-    state.add_data(selected_services=[])
-    return chat_ui.send_tracked(
-        bot,
-        call.message.chat.id,
-        state,
-        "Выберите одну или несколько услуг и нажмите «Готово»:",
-        reply_markup=services_inline(selected=set()),
-    )
+    state.add_data(selected_services=[], service_view_section_idx=None)
+    _send_service_picker(call.message.chat.id, state, "Выберите одну или несколько услуг и нажмите «Готово»:")
+    return
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "skp:md", state=BookingStates.car_model)
+def cb_skip_model(call: types.CallbackQuery, state: StateContext):
+    if not is_admin(call.from_user.id):
+        return bot.answer_callback_query(call.id)
+    chat_ui.delete_callback_message(bot, call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id)
+    apply_skip_model(call.message.chat.id, state)
 
 
 @bot.message_handler(state=BookingStates.car_model)
@@ -722,14 +757,8 @@ def step_car_model_custom(message: types.Message, state: StateContext):
     if ret:
         return goto_review(state, message.chat.id)
     state.set(BookingStates.service)
-    state.add_data(selected_services=[])
-    chat_ui.send_tracked(
-        bot,
-        message.chat.id,
-        state,
-        "Выберите одну или несколько услуг и нажмите «Готово»:",
-        reply_markup=services_inline(selected=set()),
-    )
+    state.add_data(selected_services=[], service_view_section_idx=None)
+    _send_service_picker(message.chat.id, state, "Выберите одну или несколько услуг и нажмите «Готово»:")
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "skp:sv", state=BookingStates.service)
@@ -745,18 +774,112 @@ def cb_skip_service(call: types.CallbackQuery, state: StateContext):
 def cb_service(call: types.CallbackQuery, state: StateContext):
     if not is_admin(call.from_user.id):
         return bot.answer_callback_query(call.id)
-    part = call.data.split(":")[1]
+    parts = call.data.split(":")
+    if len(parts) < 2:
+        return bot.answer_callback_query(call.id)
+    part = parts[1]
     with state.data() as data:
         ret = data.get("return_to_review")
         existing = data.get("selected_services")
         if isinstance(existing, list):
-            selected = {int(i) for i in existing if isinstance(i, int)}
+            selected = {str(i) for i in existing}
         else:
-            selected = _service_indices_from_text(str(data.get("service") or ""))
+            selected = _service_names_from_text(str(data.get("service") or ""))
+        options = [str(v) for v in (data.get("service_options") or []) if isinstance(v, str)]
+        active_section_idx = data.get("service_view_section_idx")
+    if not isinstance(active_section_idx, int):
+        active_section_idx = None
+    if part == "noop":
+        return bot.answer_callback_query(call.id)
+    if part == "all":
+        bot.answer_callback_query(call.id)
+        state.add_data(service_view_section_idx=None)
+        kb, new_options = services_inline(_current_service_catalog(), selected=selected)
+        state.add_data(service_options=new_options)
+        return bot.edit_message_reply_markup(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=kb,
+        )
+    if part == "sec" and len(parts) >= 3:
+        try:
+            sec_idx = int(parts[2])
+        except ValueError:
+            return bot.answer_callback_query(call.id)
+        catalog = _current_service_catalog()
+        if sec_idx < 0 or sec_idx >= len(catalog):
+            return bot.answer_callback_query(call.id)
+        bot.answer_callback_query(call.id)
+        state.add_data(service_view_section_idx=sec_idx)
+        kb, new_options = services_inline(catalog, selected=selected, active_section_idx=sec_idx)
+        state.add_data(service_options=new_options)
+        return bot.edit_message_reply_markup(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=kb,
+        )
+    if part == "nav" and len(parts) >= 3:
+        try:
+            sec_idx = int(parts[2])
+        except ValueError:
+            return bot.answer_callback_query(call.id)
+        catalog = _current_service_catalog()
+        if sec_idx < 0 or sec_idx >= len(catalog):
+            return bot.answer_callback_query(call.id)
+        bot.answer_callback_query(call.id)
+        state.add_data(service_view_section_idx=sec_idx)
+        kb, new_options = services_inline(catalog, selected=selected, active_section_idx=sec_idx)
+        state.add_data(service_options=new_options)
+        return bot.edit_message_reply_markup(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=kb,
+        )
+    if part == "back":
+        bot.answer_callback_query(call.id)
+        kb, new_options = services_inline(_current_service_catalog(), selected=selected)
+        state.add_data(service_options=new_options)
+        return bot.edit_message_text(
+            "Выберите одну или несколько услуг и нажмите «Готово»:",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=kb,
+        )
+    if part == "addsec":
+        state.set(BookingStates.service_section_custom)
+        bot.answer_callback_query(call.id)
+        return chat_ui.send_tracked(
+            bot,
+            call.message.chat.id,
+            state,
+            "Введите название нового раздела услуг:",
+            reply_markup=cancel_reply(),
+        )
+    if part == "addsvc":
+        catalog = _current_service_catalog()
+        if active_section_idx is None or active_section_idx < 0 or active_section_idx >= len(catalog):
+            return bot.answer_callback_query(
+                call.id,
+                "Откройте нужный раздел кнопкой «📂 ...», затем добавьте услугу.",
+                show_alert=False,
+            )
+        section_name = catalog[active_section_idx][0]
+        bot.answer_callback_query(call.id)
+        state.add_data(selected_services=sorted(selected))
+        state.set(BookingStates.service_custom)
+        state.add_data(service_add_section=section_name)
+        chat_ui.delete_callback_message(bot, call.message.chat.id, call.message.message_id)
+        return chat_ui.send_tracked(
+            bot,
+            call.message.chat.id,
+            state,
+            f"Введите название услуги для раздела «{section_name}»:",
+            reply_markup=cancel_reply(),
+        )
     if part == "done":
         if not selected:
             return bot.answer_callback_query(call.id, "Выберите хотя бы одну услугу", show_alert=False)
-        state.add_data(service=_services_text_from_indices(selected), selected_services=sorted(selected))
+        state.add_data(service=_services_text_from_names(selected), selected_services=sorted(selected))
         chat_ui.delete_callback_message(bot, call.message.chat.id, call.message.message_id)
         bot.answer_callback_query(call.id)
         if ret:
@@ -769,20 +892,87 @@ def cb_service(call: types.CallbackQuery, state: StateContext):
         idx = int(part)
     except ValueError:
         return bot.answer_callback_query(call.id)
-    if idx < 0 or idx >= len(SERVICES):
+    if idx < 0 or idx >= len(options):
         return bot.answer_callback_query(call.id)
-    if idx in selected:
-        selected.remove(idx)
+    service_name = options[idx]
+    if service_name in selected:
+        selected.remove(service_name)
     else:
-        selected.add(idx)
+        selected.add(service_name)
     state.add_data(selected_services=sorted(selected))
     bot.answer_callback_query(call.id)
+    kb, new_options = services_inline(
+        _current_service_catalog(),
+        selected=selected,
+        active_section_idx=active_section_idx,
+    )
+    state.add_data(service_options=new_options)
     bot.edit_message_reply_markup(
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
-        reply_markup=services_inline(selected=selected),
+        reply_markup=kb,
     )
     return
+
+
+@bot.message_handler(state=BookingStates.service_section_custom)
+def step_service_section_custom(message: types.Message, state: StateContext):
+    if not is_admin(message.from_user.id):
+        return access_denied(message.chat.id)
+    section_name = (message.text or "").strip()
+    created = db.add_service_section(section_name)
+    if not created:
+        return chat_ui.send_tracked(
+            bot,
+            message.chat.id,
+            state,
+            "Название раздела слишком короткое. Введите минимум 2 символа.",
+            reply_markup=cancel_reply(),
+        )
+    sec_idx = None
+    for i, sec in enumerate(db.list_service_sections()):
+        if sec == created:
+            sec_idx = i
+            break
+    state.set(BookingStates.service_custom)
+    state.add_data(service_add_section=created, service_view_section_idx=sec_idx)
+    return chat_ui.send_tracked(
+        bot,
+        message.chat.id,
+        state,
+        f"Раздел «{created}» сохранён. Теперь введите услугу для него:",
+        reply_markup=cancel_reply(),
+    )
+
+
+@bot.message_handler(state=BookingStates.service_custom)
+def step_service_custom(message: types.Message, state: StateContext):
+    if not is_admin(message.from_user.id):
+        return access_denied(message.chat.id)
+    service_name = (message.text or "").strip()
+    with state.data() as data:
+        section_name = str(data.get("service_add_section") or "").strip()
+    created = db.add_service_to_section(section_name, service_name)
+    if not created:
+        return chat_ui.send_tracked(
+            bot,
+            message.chat.id,
+            state,
+            "Не удалось добавить услугу. Проверьте, что название не слишком короткое.",
+            reply_markup=cancel_reply(),
+        )
+    state.set(BookingStates.service)
+    sec_idx = None
+    for i, (sec_name, _) in enumerate(_current_service_catalog()):
+        if sec_name == section_name:
+            sec_idx = i
+            break
+    state.add_data(service_view_section_idx=sec_idx)
+    _send_service_picker(
+        message.chat.id,
+        state,
+        f"Услуга «{created}» добавлена в раздел «{section_name}». Выберите услуги и нажмите «Готово»:",
+    )
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "skp:dt", state=BookingStates.date_pick)
@@ -1097,15 +1287,10 @@ def cb_edit_menu(call: types.CallbackQuery, state: StateContext):
     state.set(mapping[code])
     if code == "sv":
         with state.data() as data:
-            selected = _service_indices_from_text(str(data.get("service") or ""))
-        state.add_data(selected_services=sorted(selected))
-        return chat_ui.send_tracked(
-            bot,
-            call.message.chat.id,
-            state,
-            prompts[code],
-            reply_markup=services_inline(selected=selected),
-        )
+            selected = _service_names_from_text(str(data.get("service") or ""))
+        state.add_data(selected_services=sorted(selected), service_view_section_idx=None)
+        _send_service_picker(call.message.chat.id, state, prompts[code])
+        return
     if code == "dt":
         return chat_ui.send_tracked(
             bot, call.message.chat.id, state, "Новая дата:", reply_markup=date_inline()

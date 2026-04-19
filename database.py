@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Generator, Iterable, Optional
 
-from config import SQLITE_PATH
+from config import SERVICE_SECTIONS, SQLITE_PATH
 
 
 def _ensure_parent(path: Path) -> None:
@@ -69,6 +69,18 @@ def init_db() -> None:
                 model_name TEXT NOT NULL,
                 PRIMARY KEY (brand_name, model_name)
             );
+            CREATE TABLE IF NOT EXISTS service_sections (
+                name TEXT PRIMARY KEY,
+                sort_order INTEGER NOT NULL,
+                is_builtin INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS services_catalog (
+                section_name TEXT NOT NULL,
+                service_name TEXT NOT NULL,
+                sort_order INTEGER NOT NULL,
+                is_builtin INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (section_name, service_name)
+            );
             CREATE INDEX IF NOT EXISTS idx_bookings_start ON bookings(start_at);
             CREATE INDEX IF NOT EXISTS idx_bookings_status ON bookings(status);
             CREATE INDEX IF NOT EXISTS idx_bookings_master ON bookings(master_name);
@@ -76,6 +88,7 @@ def init_db() -> None:
             """
         )
         _migrate_bookings(conn)
+        _seed_service_catalog(conn)
 
 
 def _migrate_bookings(conn: sqlite3.Connection) -> None:
@@ -87,6 +100,26 @@ def _migrate_bookings(conn: sqlite3.Connection) -> None:
     if "confirm_key" not in cols:
         conn.execute("ALTER TABLE bookings ADD COLUMN confirm_key TEXT")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_bookings_confirm_key ON bookings(confirm_key)")
+
+
+def _seed_service_catalog(conn: sqlite3.Connection) -> None:
+    for sec_idx, (section_name, service_names) in enumerate(SERVICE_SECTIONS):
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO service_sections (name, sort_order, is_builtin)
+            VALUES (?, ?, 1)
+            """,
+            (section_name, sec_idx),
+        )
+        for svc_idx, service_name in enumerate(service_names):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO services_catalog
+                (section_name, service_name, sort_order, is_builtin)
+                VALUES (?, ?, ?, 1)
+                """,
+                (section_name, service_name, svc_idx),
+            )
 
 
 def list_saved_brands() -> list[str]:
@@ -160,6 +193,100 @@ def list_brands_with_saved_models() -> list[str]:
             """
         ).fetchall()
     return [r["brand_name"] for r in rows]
+
+
+def list_service_sections() -> list[str]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT name FROM service_sections
+            ORDER BY sort_order ASC, name COLLATE NOCASE ASC
+            """
+        ).fetchall()
+    return [r["name"] for r in rows]
+
+
+def list_services_in_section(section_name: str) -> list[str]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT service_name FROM services_catalog
+            WHERE section_name = ?
+            ORDER BY sort_order ASC, service_name COLLATE NOCASE ASC
+            """,
+            (section_name,),
+        ).fetchall()
+    return [r["service_name"] for r in rows]
+
+
+def list_service_catalog() -> list[tuple[str, list[str]]]:
+    out: list[tuple[str, list[str]]] = []
+    for section in list_service_sections():
+        out.append((section, list_services_in_section(section)))
+    return out
+
+
+def add_service_section(name: str) -> str | None:
+    n = (name or "").strip()
+    if len(n) < 2:
+        return None
+    with get_conn() as conn:
+        max_row = conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) AS m FROM service_sections"
+        ).fetchone()
+        next_order = int(max_row["m"]) + 1 if max_row else 0
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO service_sections (name, sort_order, is_builtin)
+            VALUES (?, ?, 0)
+            """,
+            (n, next_order),
+        )
+        row = conn.execute(
+            "SELECT name FROM service_sections WHERE lower(name) = lower(?)",
+            (n,),
+        ).fetchone()
+    return str(row["name"]) if row else None
+
+
+def add_service_to_section(section_name: str, service_name: str) -> str | None:
+    sec = (section_name or "").strip()
+    svc = (service_name or "").strip()
+    if len(sec) < 1 or len(svc) < 2:
+        return None
+    with get_conn() as conn:
+        sec_row = conn.execute(
+            "SELECT name FROM service_sections WHERE lower(name) = lower(?)",
+            (sec,),
+        ).fetchone()
+        if not sec_row:
+            return None
+        sec_name = str(sec_row["name"])
+        max_row = conn.execute(
+            """
+            SELECT COALESCE(MAX(sort_order), -1) AS m
+            FROM services_catalog
+            WHERE section_name = ?
+            """,
+            (sec_name,),
+        ).fetchone()
+        next_order = int(max_row["m"]) + 1 if max_row else 0
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO services_catalog
+            (section_name, service_name, sort_order, is_builtin)
+            VALUES (?, ?, ?, 0)
+            """,
+            (sec_name, svc, next_order),
+        )
+        row = conn.execute(
+            """
+            SELECT service_name FROM services_catalog
+            WHERE lower(section_name) = lower(?) AND lower(service_name) = lower(?)
+            """,
+            (sec_name, svc),
+        ).fetchone()
+    return str(row["service_name"]) if row else None
 
 
 @dataclass
