@@ -187,6 +187,7 @@ def edit_field_inline() -> types.InlineKeyboardMarkup:
         ("🚗 Авто", "cr"),
         ("🧰 Услуга", "sv"),
         ("📅 Дата/время", "dt"),
+        ("💬 Комментарий", "nt"),
     ]
     for label, code in fields:
         kb.add(types.InlineKeyboardButton(label, callback_data=f"ed:{code}"))

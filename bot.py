@@ -109,6 +109,7 @@ class BookingStates(StatesGroup):
     date_text = State()
     time_pick = State()
     time_text = State()
+    notes = State()
     review = State()
     pick_edit = State()
     report_query = State()
@@ -158,12 +159,15 @@ def draft_lines(data: dict[str, Any]) -> str:
             dt_s = combine_local_datetime(dd, h, m).strftime("%d.%m.%Y %H:%M")
         except Exception:
             dt_s = f"{d} {t}"
+    notes = (data.get("notes") or "").strip()
+    notes_display = notes if notes else FIELD_SKIPPED
     return (
         f"Клиент: {data.get('client_name', '—')}\n"
         f"Телефон: {data.get('phone', '—')}\n"
         f"Авто: {data.get('make_model', '—')}\n"
         f"Услуги: {data.get('service', '—')}\n"
-        f"Дата и время: {dt_s}"
+        f"Дата и время: {dt_s}\n"
+        f"Комментарий: {notes_display}"
     )
 
 
@@ -284,6 +288,23 @@ def apply_skip_time(chat_id: int, state: StateContext) -> None:
     _pop_state_keys(state, "booking_time")
     with state.data() as data:
         ret = data.get("return_to_review")
+    if ret:
+        goto_review(state, chat_id)
+        return
+    state.set(BookingStates.notes)
+    chat_ui.send_tracked(
+        bot,
+        chat_id,
+        state,
+        "Дополнительный комментарий к записи (или «Пропустить»):",
+        reply_markup=skip_or_cancel_reply(),
+    )
+
+
+def apply_skip_notes(chat_id: int, state: StateContext) -> None:
+    with state.data() as data:
+        ret = data.get("return_to_review")
+    state.add_data(notes="")
     if ret:
         goto_review(state, chat_id)
         return
@@ -1121,8 +1142,30 @@ def _finish_time_pick(chat_id: int, state: StateContext, h: int, m: int) -> None
     state.add_data(booking_time=(h, m))
     if ret:
         return goto_review(state, chat_id)
+    state.set(BookingStates.notes)
+    chat_ui.send_tracked(
+        bot,
+        chat_id,
+        state,
+        "Дополнительный комментарий к записи (или «Пропустить»):",
+        reply_markup=skip_or_cancel_reply(),
+    )
+
+
+@bot.message_handler(state=BookingStates.notes)
+def step_notes(message: types.Message, state: StateContext):
+    if not is_admin(message.from_user.id):
+        return access_denied(message.chat.id)
+    raw = (message.text or "").strip()
+    if is_skip_text(raw):
+        return apply_skip_notes(message.chat.id, state)
+    with state.data() as data:
+        ret = data.get("return_to_review")
+    state.add_data(notes=raw)
+    if ret:
+        return goto_review(state, message.chat.id)
     state.set(BookingStates.review)
-    send_review(chat_id, state)
+    send_review(message.chat.id, state)
 
 
 def send_review(chat_id: int, state: StateContext) -> None:
@@ -1191,6 +1234,7 @@ def cb_confirm(call: types.CallbackQuery, state: StateContext):
             "make_model": data.get("make_model") or FIELD_SKIPPED,
             "service": data.get("service") or SERVICE_SKIPPED,
             "start_at": start_at,
+            "notes": (data.get("notes") or "").strip(),
         }
     confirm_key = f"{call.message.chat.id}:{call.message.message_id}"
     bid = db.create_booking(
@@ -1201,6 +1245,7 @@ def cb_confirm(call: types.CallbackQuery, state: StateContext):
         start_at=payload["start_at"],
         license_plate="",
         master_name=None,
+        notes=payload["notes"] or None,
         admin_telegram_id=call.from_user.id,
         confirm_key=confirm_key,
     )
@@ -1237,6 +1282,8 @@ def cb_confirm(call: types.CallbackQuery, state: StateContext):
                 f"Услуга: {payload['service']}\n"
                 f"ID в боте: {bid}"
             )
+            if payload["notes"]:
+                desc += f"\nКомментарий: {payload['notes']}"
             uid, href = yandex_calendar.create_calendar_event(
                 summary=f"{payload['service']} — {payload['client_name']}",
                 description=desc,
@@ -1275,12 +1322,14 @@ def cb_edit_menu(call: types.CallbackQuery, state: StateContext):
         "cr": BookingStates.car_brand,
         "sv": BookingStates.service,
         "dt": BookingStates.date_pick,
+        "nt": BookingStates.notes,
     }
     prompts = {
         "nm": "Новое имя клиента (или «Пропустить»):",
         "ph": "Новый телефон (или «Пропустить»):",
         "cr": "Выберите марку и модель:",
         "sv": "Выберите одну или несколько услуг и нажмите «Готово»:",
+        "nt": "Новый комментарий к записи (или «Пропустить»):",
     }
     if code not in mapping:
         return
